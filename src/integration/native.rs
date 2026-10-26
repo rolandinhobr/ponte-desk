@@ -385,7 +385,7 @@ impl Coordinator {
             } else {
                 peer
             };
-            let status = serde_json::json!({"timestamp":now_ms() as f64/1000.,"pid":std::process::id(),"side":self.config.side,
+            let status = serde_json::json!({"timestamp":now_ms() as f64/1000.,"pid":std::process::id(),"side":self.config.side,"peer_paused":self.peer.as_ref().is_some_and(|p|p.manual_pause),"peer_address":self.learned.map(|a|a.ip().to_string()),
                 "local":self.local,"peer_age":if peer.is_some(){Some(self.peer_seen.elapsed().as_secs_f64())}else{None},
                 "peer_engine":peer.map(|p|serde_json::json!({"capture_installed":p.capture,"emulation_enabled":p.emulation,"ack":p.ack})),
                 "policy":[self.applied.capture,self.applied.emulation,self.applied.reason],

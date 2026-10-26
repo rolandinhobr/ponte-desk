@@ -1,6 +1,6 @@
 # Opções
 
-As preferências do Mac ficam em `preferences.json`, separadas das identidades e da chave de pareamento. O painel aplica as mudanças sem um observador adicional. Opções inválidas pausam o compartilhamento até serem corrigidas.
+Os painéis do Mac e do Windows editam as mesmas preferências. O Mac mantém a cópia validada; o Windows a recebe pelo canal autenticado. As preferências do Mac ficam em `preferences.json`, separadas das identidades e da chave de pareamento. O painel aplica as mudanças sem um observador adicional. Opções inválidas pausam o compartilhamento até serem corrigidas.
 
 | Opção | Padrão | Efeito |
 |---|---|---|
@@ -22,3 +22,9 @@ Mude a entrada física para o Mac e clique em **Identificar entrada do Mac**. De
 A reorganização de janelas é feita pelo próprio macOS. Não há garantia de restaurar a posição individual de cada janela ou Space. O recurso preserva a disposição, os modos e as frequências disponíveis e nunca desativa a última tela utilizável.
 
 Autenticação, liberação de teclas, proteção em falha de rede e isolamento cooperativo não são opções desligáveis.
+
+## Barra de menus e bandeja
+
+O mesmo símbolo aparece no Mac e no Windows. O menu oferece abrir o painel, pausar/retomar teclado e mouse, ajustes, parar webcam e encerrar. Pausar em um lado pausa o par; retomar limpa as pausas manuais nos dois. Isso não remove o isolamento de agentes nem ignora tela cheia.
+
+No Windows, a janela pode ficar fechada sem interromper uma sessão. Encerrar desmonta o cartão normalmente e aguarda a limpeza antes de fechar o motor. Se houver arquivos ocupados ou uma autorização pendente, o app preserva a sessão e informa a pendência.

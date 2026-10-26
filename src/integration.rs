@@ -178,7 +178,11 @@ pub(crate) fn monitor_catalog() -> serde_json::Value {
     {
         windows::monitor_catalog()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::monitor_catalog()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         serde_json::json!({"monitors":[]})
     }

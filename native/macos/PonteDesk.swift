@@ -100,7 +100,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private var lastManageDisplays:Bool?
+    private var lastRestoreRequest:Double=0
     func updateDisplay() {
+        let managed=options["manage_displays"] as? Bool == true
+        let request=readJSON("display-restore-request.json")["time"] as? Double ?? 0
+        if (lastManageDisplays == true && !managed) || request>lastRestoreRequest {
+            displays.lastEnable=nil;displays.update(enable:true,root:root)
+        }
+        lastManageDisplays=managed;lastRestoreRequest=request
+
         let state=readJSON("observer-status.json")
         guard let stamp=state["timestamp"] as? Double, Date().timeIntervalSince1970-stamp < 3,
               let display=state["display"] as? [String:Any], display["automatic"] as? Bool == true,
@@ -178,7 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "Controle local protegido"
     }
 
-    var paused: Bool { FileManager.default.fileExists(atPath: root.appendingPathComponent("manual-pause").path) }
+    var paused: Bool { FileManager.default.fileExists(atPath: root.appendingPathComponent("manual-pause").path) || readJSON("observer-status.json")["peer_paused"] as? Bool == true }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
@@ -218,10 +227,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func togglePause() {
-        let path=root.appendingPathComponent("manual-pause")
-        if paused { try? FileManager.default.removeItem(at:path) }
-        else { try? Data("paused".utf8).write(to:path,options:.atomic) }
-        refreshPanel()
+        guard let peer=cameraPeer else{return}
+        command(["settings","bridge","--enabled",paused ? "true":"false","--peer",peer]){[weak self] result in
+            if let error=result["error"] as? String{self?.detailText?.stringValue=error;self?.detailText?.isHidden=false}
+            self?.refreshPanel()
+        }
     }
 
     @objc func openPermissions() {
@@ -435,3 +445,19 @@ final class DisplayController {
     }
 }
 extension SavedScreen: Equatable {}
+
+// Enumerates display metadata for either computer's settings panel.
+@_cdecl("ponte_monitor_catalog_json")
+public func ponteMonitorCatalogJSON()->UnsafeMutablePointer<CChar>? {
+    autoreleasepool {
+        var ids=[CGDirectDisplayID](repeating:0,count:32);var count:UInt32=0
+        _ = CGGetActiveDisplayList(32,&ids,&count)
+        var monitors=ids.prefix(Int(count)).compactMap{id -> [String:Any]? in
+            guard CGDisplayIsBuiltin(id)==0,let uuid=CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else{return nil}
+            return ["id":CFUUIDCreateString(nil,uuid) as String,"name":"Monitor externo do Mac"]
+        }
+        if let saved=MonitorIdentity.configuration["mac_monitor_uuid"] as? String,!saved.isEmpty,!monitors.contains(where:{$0["id"] as? String==saved}){monitors.append(["id":saved,"name":"Monitor configurado (desativado)"])}
+        guard let data=try? JSONSerialization.data(withJSONObject:["monitors":monitors]) else{return nil}
+        return strdup(String(decoding:data,as:UTF8.self))
+    }
+}

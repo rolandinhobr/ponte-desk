@@ -13,3 +13,9 @@ Na preparação da versão 0.3, passaram 22 testes no Mac e 20 no Windows, além
 Após a instalação local da 0.3, uma webcam USB externa no Windows entregou 60 amostras ao consumidor CMIO do Mac em 1920×1080; 46 amostras de espera foram rejeitadas. A captura foi encerrada após o teste, sem salvar imagens. O recebimento no Windows também precisa ser conferido com o consumidor de destino de cada instalação.
 
 O dispositivo Windows com o nome Ponte Desk Camera também passou no consumidor Media Foundation: 64 quadros, padrões vermelho e azul, saída NV12 1920×1080, produtor sem elevação e zero dispositivos temporários restantes após parar. Os probes pareados completaram cinco trocas Ping/Pong em cada direção, sem enviar entrada.
+
+Na preparação da 0.5, passaram 25 testes do motor no Mac e 23 no Windows, Clippy e os testes de coordenação e de ciclo de vida do armazenamento. A interface Windows compilou com avisos tratados como erros e passou em 15 verificações de argumentos pela API Windows, identificação de sessões, JSON e ícone. A fixture visual usa dados vazios de prévia e não acessa câmera ou cartão reais.
+
+Na instalação de desenvolvimento, o comando do painel do Mac pausou os dois lados. Também passaram pausa/retomada e leitura/atualização sem mudança das opções a partir do Windows. Após a renovação de permissões, os snapshots recentes confirmaram captura e emulação ativas nos dois computadores. Uma instância de interface e uma de motor foram observadas no Windows, com interface sem elevação.
+
+O teste físico de SD Mac → Windows leu um arquivo existente, conferiu o SHA256 na origem e no destino, negou uma abertura para escrita sem gravar/truncar bytes e recusou desmontar enquanto havia um handle de leitura aberto. Depois de fechar o handle, a desmontagem e a remoção do compartilhamento foram confirmadas. O teste físico Windows → Mac continua pendente; a implementação desse sentido não equivale a uma validação física concluída.

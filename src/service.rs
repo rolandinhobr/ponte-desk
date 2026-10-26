@@ -154,6 +154,8 @@ impl Service {
         loop {
             tokio::select! {
                 _ = guard_tick.tick() => {
+                    let stop = crate::integration::preferences_root().join(format!("engine-stop-{}",std::process::id()));
+                    if stop.exists() { let _=std::fs::remove_file(stop); break; }
                     let changed = self.integration.refresh();
                     if changed {
                         log::info!("integration: {}", self.integration.policy.reason);

@@ -21,7 +21,7 @@ O modo padrão usa **telas independentes**. Não exige monitor específico, DDC 
 
 ## Como funciona
 
-O painel fica na barra de menus do Mac. O mesmo projeto fornece o serviço nativo do Windows. Sem conta, nuvem, NAS ou assinatura, e sem precisar manter outro aplicativo aberto. A webcam física só é capturada após o início manual do compartilhamento.
+O painel fica na barra de menus do Mac e na bandeja do Windows, com o mesmo símbolo e os mesmos recursos. Os dois aplicativos permitem pausar/retomar teclado e mouse, controlar webcam e cartão SD, e editar os ajustes compartilhados. Fechar a janela mantém o aplicativo na barra; use Encerrar Ponte Desk no menu para finalizar. Sem conta, nuvem, NAS ou assinatura, e sem precisar manter outro aplicativo aberto. A webcam física só é capturada após o início manual do compartilhamento.
 
 No aplicativo de chamada, escolha **Ponte Desk Camera**. No Mac, o componente assinado publica uma saída 1080p; a opção 720p reduz captura e rede, e o receptor adapta a imagem. O microfone continua sendo o escolhido localmente no aplicativo de chamada.
 
@@ -30,7 +30,7 @@ No aplicativo de chamada, escolha **Ponte Desk Camera**. No Mac, o componente as
 - macOS 14 ou posterior e Windows 11.
 - Mesma rede local; conexão por cabo é recomendada para vídeo.
 - Webcam USB externa para compartilhar câmera. Não há substituição automática pela câmera integrada.
-- Pareamento configurado nos dois lados. Esta versão oferece um par Mac–Windows; o painel atual está no Mac.
+- Pareamento configurado nos dois lados. Esta versão oferece um par Mac–Windows; há um aplicativo instalado em cada máquina.
 
 ## Compilar e instalar
 
@@ -50,11 +50,12 @@ No Windows, use Rust com MSVC ou GNU/MinGW:
 cargo build --release --no-default-features
 ./native/windows/webcam/build.ps1
 ./native/windows/storage/build.ps1
+./native/windows/app/build.ps1
 ```
 
-A DLL de câmera requer MSVC x64 e Windows SDK 26100. Veja [instalação e pareamento](docs/setup.md), [opções](docs/options.md) e [componente da câmera](docs/camera-component.md). Depois do pareamento, o instalador `scripts/install-windows.ps1` registra a DLL uma vez e inicia o serviço em usuário comum.
+A interface Windows usa WinForms e o .NET Framework incluído no Windows 11, sem WebView ou outro aplicativo residente. A DLL de câmera requer MSVC x64 e Windows SDK 26100. Veja [instalação e pareamento](docs/setup.md), [opções](docs/options.md) e [componente da câmera](docs/camera-component.md). Depois do pareamento, o instalador `scripts/install-windows.ps1` registra a DLL uma vez e inicia o serviço em usuário comum.
 
-**Use a mesma versão nos dois computadores.** O armazenamento requer a versão 0.4 nos dois lados. A versão 0.3 introduz opções autenticadas no protocolo de coordenação; atualize o par junto.
+**Use a mesma versão nos dois computadores.** O controle dos ajustes pelos dois lados exige a versão 0.5. O armazenamento requer a versão 0.4 ou posterior nos dois lados. A versão 0.3 introduz opções autenticadas no protocolo de coordenação; atualize o par junto.
 
 ## Ajustes
 

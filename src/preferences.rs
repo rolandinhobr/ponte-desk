@@ -101,6 +101,65 @@ impl Preferences {
     }
 }
 
+/// Only user-facing options can cross the authenticated control channel.
+pub(crate) fn patch_at(root: &Path, patch: &serde_json::Value) -> io::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(Preferences::load(root))?;
+    let fields = patch
+        .as_object()
+        .ok_or_else(|| io::Error::other("options object required"))?;
+    for (key, next) in fields {
+        if value.get(key).is_none() {
+            return Err(io::Error::other("unknown option"));
+        }
+        value[key] = next.clone();
+    }
+    let options: Preferences = serde_json::from_value(value)?;
+    options.save(root)?;
+    Ok(serde_json::json!({"ok":true,"options":options}))
+}
+pub(crate) fn rpc(op: &str, request: &serde_json::Value) -> io::Result<serde_json::Value> {
+    let root = crate::integration::preferences_root();
+    match op {
+        "settings.show" => Ok(serde_json::to_value(Preferences::load(&root))?),
+        "settings.update" => {
+            #[cfg(windows)]
+            return Err(io::Error::other("update the shared options on the Mac"));
+            #[cfg(not(windows))]
+            patch_at(&root, &request["patch"])
+        }
+        "settings.input" => {
+            let enabled = request["enabled"]
+                .as_bool()
+                .ok_or_else(|| io::Error::other("enabled must be boolean"))?;
+            set_input_at(&root, enabled)?;
+            Ok(serde_json::json!({"ok":true}))
+        }
+        "settings.restore" => {
+            patch_at(&root, &serde_json::json!({"manage_displays":false}))?;
+            crate::integration::atomic_preferences(
+                &root,
+                "display-restore-request.json",
+                &serde_json::json!({"time":crate::integration::now_ms()}),
+            )?;
+            Ok(serde_json::json!({"ok":true}))
+        }
+        _ => Err(io::Error::other("unsupported settings command")),
+    }
+}
+fn set_input_at(root: &Path, enabled: bool) -> io::Result<()> {
+    fs::create_dir_all(root)?;
+    let path = root.join("manual-pause");
+    if enabled {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        fs::write(path, b"paused")
+    }
+}
+
 pub fn dispatch() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("settings") {
@@ -109,9 +168,67 @@ pub fn dispatch() -> Option<i32> {
     let result = (|| -> io::Result<serde_json::Value> {
         let arg = |key: &str| args.windows(2).find(|v| v[0] == key).map(|v| v[1].as_str());
         match args.get(1).map(String::as_str) {
-            Some("show") => Ok(serde_json::to_value(Preferences::load(
-                &crate::integration::preferences_root(),
-            ))?),
+            Some("show") | Some("update") | Some("input") | Some("restore") => {
+                let verb = args[1].as_str();
+                let mut request = serde_json::json!({"op":format!("settings.{verb}")});
+                if verb == "update" {
+                    request["patch"] = serde_json::from_str(
+                        arg("--patch").ok_or_else(|| io::Error::other("patch required"))?,
+                    )?;
+                }
+                if verb == "input" {
+                    request["enabled"] = serde_json::json!(
+                        arg("--enabled")
+                            .ok_or_else(|| io::Error::other("enabled required"))?
+                            .parse::<bool>()
+                            .map_err(io::Error::other)?
+                    );
+                }
+                if let Some(peer) = arg("--peer") {
+                    crate::webcam::remote_command(peer, request)
+                } else {
+                    rpc(&format!("settings.{verb}"), &request)
+                }
+            }
+            Some("bridge") => {
+                let enabled = arg("--enabled")
+                    .ok_or_else(|| io::Error::other("enabled required"))?
+                    .parse::<bool>()
+                    .map_err(io::Error::other)?;
+                let peer = arg("--peer").ok_or_else(|| io::Error::other("paired peer required"))?;
+                let root = crate::integration::preferences_root();
+                if !enabled {
+                    set_input_at(&root, false)?;
+                }
+                let reply = crate::webcam::remote_command(
+                    peer,
+                    serde_json::json!({"op":"settings.input","enabled":enabled}),
+                )?;
+                if let Some(error) = reply["error"].as_str() {
+                    return Err(io::Error::other(error.to_owned()));
+                }
+                if enabled {
+                    set_input_at(&root, true)?;
+                }
+                Ok(serde_json::json!({"ok":true}))
+            }
+            Some("shutdown") => {
+                let pid = arg("--pid")
+                    .ok_or_else(|| io::Error::other("pid required"))?
+                    .parse::<u32>()
+                    .map_err(io::Error::other)?;
+                if pid < 2 {
+                    return Err(io::Error::other("invalid daemon pid"));
+                }
+                let root = crate::integration::preferences_root();
+                let state: serde_json::Value =
+                    serde_json::from_slice(&fs::read(root.join("engine-status.json"))?)?;
+                if state["pid"] != pid {
+                    return Err(io::Error::other("daemon changed"));
+                }
+                fs::write(root.join(format!("engine-stop-{pid}")), b"stop")?;
+                Ok(serde_json::json!({"ok":true}))
+            }
             Some("monitors") => match arg("--peer") {
                 Some(peer) => {
                     crate::webcam::remote_command(peer, serde_json::json!({"op":"monitors"}))
@@ -164,6 +281,43 @@ pub(crate) fn set_layout(value: &str) -> io::Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_patch_preserves_pairing_and_rejects_unknown_or_mistyped_fields() {
+        let root = std::env::temp_dir().join(format!("ponte-ui-options-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("observer.json"), b"preserved private pairing").unwrap();
+        Preferences::default().save(&root).unwrap();
+        assert!(patch_at(&root, &serde_json::json!({"key":"not an option"})).is_err());
+        assert!(
+            patch_at(
+                &root,
+                &serde_json::json!({"protect_mac_fullscreen":"false"})
+            )
+            .is_err()
+        );
+        patch_at(
+            &root,
+            &serde_json::json!({"webcam_enabled":false,"peer_name":"Desktop"}),
+        )
+        .unwrap();
+        let saved = Preferences::load(&root);
+        assert!(!saved.webcam_enabled);
+        assert!(saved.protect_mac_fullscreen);
+        assert_eq!(saved.peer_name, "Desktop");
+        assert_eq!(
+            fs::read(root.join("observer.json")).unwrap(),
+            b"preserved private pairing"
+        );
+        fs::create_dir_all(root.join("agent-leases")).unwrap();
+        fs::write(root.join("agent-leases/other-agent.json"), b"preserve").unwrap();
+        set_input_at(&root, false).unwrap();
+        assert!(root.join("manual-pause").exists());
+        set_input_at(&root, true).unwrap();
+        set_input_at(&root, true).unwrap();
+        assert!(root.join("agent-leases/other-agent.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn new_setup_does_not_require_monitor_or_ddc() {
         let p = Preferences::default();

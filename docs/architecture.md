@@ -1,10 +1,10 @@
 # Arquitetura
 
-O executável Rust reúne transporte KVM, captura/emulação, coordenação autenticada e controle de webcam. A biblioteca Swift/AppKit pertence ao mesmo bundle do Mac e fornece interface, metadados de telas, captura USB e produtor CMIO. O Windows possui captura USB e câmera virtual Media Foundation na DLL nativa do projeto.
+O executável Rust reúne transporte KVM, captura/emulação, coordenação autenticada e controle de webcam. A biblioteca Swift/AppKit pertence ao mesmo bundle do Mac e fornece interface, metadados de telas, captura USB e produtor CMIO. A interface WinForms do Windows usa a mesma identidade visual e instala-se com o motor, a captura USB e a câmera virtual Media Foundation. O launcher permanece como usuário comum, controla uma única instância do motor e recolhe a janela para a bandeja.
 
-São três recursos independentes. A política do modo comum não consulta a entrada do monitor. No modo de monitor compartilhado, o Windows observa somente o monitor selecionado em um worker de DDC; a UI do Mac só reorganiza telas com identificação válida e amostra recente.
+Entrada, câmera e armazenamento têm controles independentes. A política do modo comum não consulta a entrada do monitor. No modo de monitor compartilhado, o Windows observa somente o monitor selecionado em um worker de DDC; a UI do Mac só reorganiza telas com identificação válida e amostra recente.
 
-O controle de entrada usa o protocolo DTLS herdado do upstream. O estado de coordenação v3 usa HMAC-SHA256, sessão aleatória, sequência e validade; preferências do painel são transportadas nesse estado. O Mac controla as opções do par atual. Identidades privadas permanecem nos diretórios do usuário.
+O controle de entrada usa o protocolo DTLS herdado do upstream. O estado de coordenação v3 usa HMAC-SHA256, sessão aleatória, sequência e validade; preferências do painel são transportadas nesse estado. Os dois painéis editam as opções do par por comandos TLS autenticados; o Mac valida e mantém a cópia canônica. Pausa/retomada age nos dois lados, sem alterar leases ou proteções de tela cheia. Identidades privadas permanecem nos diretórios do usuário.
 
 A câmera usa TLS 1.3 com certificado pareado fixado e prova HMAC por desafio. O listener de controle aguarda conexões sem polling; a captura física permanece desligada quando o compartilhamento não está em uso. A captura conserva o frame mais recente, os receptores têm pools limitados e a rede tem timeouts. Não há arquivos de frames, fila crescente ou captura de tela para detectar atividade.
 
@@ -13,3 +13,5 @@ A extensão CMIO é um componente de sistema instalado uma vez. O host original 
 O estado desejado de política, o estado nativo dos hooks e a conexão DTLS são evidências distintas. Um status de captura ativa não prova que os comandos estejam chegando ao outro computador. O probe pareado verifica o transporte sem injetar entrada.
 
 O módulo de armazenamento controla sessões explícitas de SMB nativo. A listagem e os comandos administrativos ficam fora do pipeline de entrada. O Mac usa Disk Arbitration, NetFS e um auxiliar XPC acionado por SMAppService; o Windows usa Win32 para identificar mídia removível, mapear unidades e manter uma sessão administrativa com IPC local autenticado pelo PID. O tráfego dos arquivos fica no SMB do sistema, com criptografia e acesso somente leitura no compartilhamento. Nenhuma senha SMB passa pelo protocolo do Ponte Desk.
+
+A interface Windows lê snapshots locais a cada segundo; consultas remotas de armazenamento ocorrem apenas com o painel visível ou uma sessão ativa. Não há navegador embutido, varredura contínua de volumes ou observador de scripts. Um evento local e mutex por usuário impedem múltiplos ícones e permitem reabrir o painel pelo atalho. A saída pede desmontagem sem força, aguarda limpeza e solicita encerramento normal do motor; uma falha preserva a sessão e a interface.

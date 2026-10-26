@@ -49,3 +49,7 @@ jobs:
       - name: Storage lifecycle without hardware
         if: runner.os == 'macOS'
         run: python3 tests/storage_lifecycle.py target/release/ponte-desk
+      - name: Build Windows application and interface checks
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./native/windows/app/build.ps1

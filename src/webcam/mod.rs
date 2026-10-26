@@ -499,6 +499,7 @@ fn receiver() -> io::Result<Receiver> {
     })
 }
 fn send(device: &str, peer: &str, format: Format) -> io::Result<()> {
+    let initial_stop = fs::read(root().join("webcam-stop")).ok();
     if !crate::preferences::Preferences::load(&root()).webcam_enabled {
         return Err(io::Error::other("Webcam sharing is disabled in settings"));
     }
@@ -552,6 +553,10 @@ fn send(device: &str, peer: &str, format: Format) -> io::Result<()> {
     if &ready != b"READY" {
         return Err(io::Error::other("camera receiver did not become ready"));
     }
+    if !parent_alive() || fs::read(root().join("webcam-stop")).ok() != initial_stop {
+        status("idle", 0, "Webcam externa desligada");
+        return Ok(());
+    }
     let mut camera = platform_capture(device, format).map_err(io::Error::other)?;
     let mut buffer = vec![0; MAX_JPEG];
     let mut frames = 0u64;
@@ -565,8 +570,9 @@ fn send(device: &str, peer: &str, format: Format) -> io::Result<()> {
     status("sending", 0, &sending_message);
     loop {
         if parent_check.elapsed() >= Duration::from_secs(1) {
-            if !parent_alive() {
-                return Err(io::Error::other("camera controller exited"));
+            if !parent_alive() || fs::read(root().join("webcam-stop")).ok() != initial_stop {
+                status("idle", 0, "Webcam externa desligada");
+                return Ok(());
             }
             parent_check = std::time::Instant::now();
         }
@@ -599,6 +605,15 @@ pub fn dispatch() -> Option<i32> {
     }
     let result = (|| -> Result<(), String> {
         match args.get(1).map(String::as_str) {
+            Some("stop-local") => {
+                fs::write(
+                    root().join("webcam-stop"),
+                    crate::integration::now_ms().to_string(),
+                )
+                .map_err(|e| e.to_string())?;
+                println!("{{\"ok\":true}}");
+                Ok(())
+            }
             Some("doctor") => {
                 let local = platform_list().and_then(|json| {
                     serde_json::from_str::<serde_json::Value>(&json).map_err(|e| e.to_string())
@@ -824,6 +839,9 @@ fn receive_command(
     let request: serde_json::Value = serde_json::from_slice(&data)?;
     let result = (|| -> Result<serde_json::Value, String> {
         match request["op"].as_str() {
+            Some(op) if op.starts_with("settings.") => {
+                crate::preferences::rpc(op, &request).map_err(|e| e.to_string())
+            }
             Some(op) if op.starts_with("storage.") => crate::storage::rpc(peer, op, &request),
             Some("monitors") => Ok(crate::integration::monitor_catalog()),
             Some("layout") => {
@@ -837,6 +855,10 @@ fn receive_command(
             }
             Some("list") => serde_json::from_str(&platform_list()?).map_err(|e| e.to_string()),
             Some("stop") => {
+                let _ = fs::write(
+                    root().join("webcam-stop"),
+                    crate::integration::now_ms().to_string(),
+                );
                 let mut guard = control
                     .lock()
                     .map_err(|_| "camera controller unavailable")?;
