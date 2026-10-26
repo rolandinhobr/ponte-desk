@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+helper=/Library/PrivilegedHelperTools/br.com.ponte-desk.storage-helper
+plist=/Library/LaunchDaemons/br.com.ponte-desk.storage-helper.plist
+/usr/sbin/chown root:wheel "$helper" "$plist"
+/bin/chmod 755 "$helper"
+/bin/chmod 644 "$plist"
+/bin/launchctl enable system/br.com.ponte-desk.storage-helper
+/bin/launchctl bootstrap system "$plist"

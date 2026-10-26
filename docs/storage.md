@@ -16,7 +16,11 @@ O computador com o cartão precisa permanecer ligado e acessível. Aplicativos q
 
 ## Configuração do Mac como origem
 
-**Configurar…** registra o auxiliar incluído no próprio aplicativo. A primeira ativação exige permitir **Ponte Desk** em **Atividade de Apps em 2º Plano**, nos Itens de Início de Sessão e Extensões. Se o sistema devolver “Operation not permitted”, confira essa autorização antes de repetir a configuração.
+**Configurar…** verifica o auxiliar e abre o Instalador do macOS quando ele está ausente ou precisa ser atualizado. Conclua a instalação de **PonteDeskStorage** com a autorização administrativa na janela do sistema e clique novamente em **Configurar…**. O pacote está incluído no aplicativo; não exige assinatura paga, download adicional ou outro aplicativo em execução.
+
+O Instalador coloca o executável em `/Library/PrivilegedHelperTools/br.com.ponte-desk.storage-helper` e o registro em `/Library/LaunchDaemons/br.com.ponte-desk.storage-helper.plist`, ambos pertencentes a root. O cliente confere proprietário, permissões e SHA256 do executável e fixa a conexão XPC ao hash da assinatura do auxiliar incluído no aplicativo. O componente é iniciado sob demanda e encerra após ficar sem sessões. O app só informa que ele está pronto após uma resposta XPC real.
+
+Versões anteriores usavam SMAppService com assinatura ad hoc. Essa combinação pode falhar na restrição de lançamento do macOS mesmo após a autorização em Itens de Início. Configurar remove somente esse registro antigo do Ponte Desk antes de abrir o instalador. Nenhuma permissão de outro aplicativo é modificada e a base de Itens de Início não é reiniciada. A instalação e a migração recusam sessões SD ainda compartilhadas.
 
 Também é necessário ativar o SMB e habilitar uma conta em **Geral → Compartilhamento → Compartilhar Arquivos → Opções**. Antes de ativar, revise as pastas já cadastradas: elas pertencem à configuração de compartilhamento do macOS, e não ao Ponte Desk. O aplicativo não remove nem muda compartilhamentos existentes.
 
@@ -40,4 +44,4 @@ Interrupções abruptas do auxiliar podem impedir confirmar a limpeza. Nesse cas
 
 Fechar a janela ou escolher **Encerrar Ponte Desk** sempre encerra o app, mesmo se a rede estiver indisponível, houver um pedido de autorização aberto ou o cartão estiver em erro. O encerramento cancela os comandos próprios com um prazo local limitado. Não força a desmontagem de volumes e não declara uma limpeza desconhecida como concluída.
 
-O botão **Desmontar e parar** continua usando desmontagem normal e recusa arquivos ocupados. Se o controlador já saiu, o Mac confere a lista real de compartilhamentos para liberar uma sessão antiga. A atualização do auxiliar é vinculada à versão do aplicativo e à assinatura/conteúdo do componente; o app testa uma conexão real com ele antes de pedir autorização para publicar o cartão. Se o macOS solicitar aprovação em Atividade de Apps em 2º Plano, ela precisa ser renovada para o componente atualizado.
+O botão **Desmontar e parar** continua usando desmontagem normal e recusa arquivos ocupados. Se o controlador já saiu, o Mac confere a lista real de compartilhamentos para liberar uma sessão antiga. A atualização do auxiliar é vinculada à assinatura/conteúdo do componente; o app testa uma conexão real com ele antes de pedir autorização para publicar o cartão.

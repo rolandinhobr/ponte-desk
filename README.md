@@ -42,7 +42,7 @@ No Mac, instale Rust estável e as ferramentas de linha de comando do Xcode:
 ./scripts/build-macos.sh
 ```
 
-O aplicativo é criado em `dist/Ponte Desk.app`. A assinatura local do aplicativo é ad hoc; o componente de câmera mantém a assinatura notarizada de seu fornecedor. Compilar não ativa extensões nem concede permissões.
+O aplicativo é criado em `dist/Ponte Desk.app`. A assinatura local do aplicativo é ad hoc; o componente de câmera mantém a assinatura notarizada de seu fornecedor. Compilar não ativa extensões nem concede permissões. Para publicar cartões pelo Mac, **Configurar…** abre o instalador do auxiliar incluído, que exige autorização administrativa normal do macOS.
 
 No Windows, use Rust com MSVC ou GNU/MinGW:
 

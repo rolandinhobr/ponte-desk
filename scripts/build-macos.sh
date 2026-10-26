@@ -16,6 +16,7 @@ cp "$project_dir/native/macos/storage/br.com.ponte-desk.storage-helper.plist" "$
 cp "$target_dir/release/ponte-desk" "$app/Contents/MacOS/ponte-desk"
 cp "$project_dir/native/macos/Info.plist" "$app/Contents/Info.plist"
 mkdir -p "$app/Contents/Resources"
+sh "$project_dir/scripts/build-macos-storage-package.sh" "$app/Contents/MacOS/ponte-storage-helper" "$app/Contents/Resources/PonteDeskStorage.pkg"
 swiftc -O "$project_dir/native/macos/PonteArtwork.swift" "$project_dir/native/macos/render-icon.swift" -o "$stage/render-icon" -framework AppKit
 "$stage/render-icon" "$stage/PonteDesk.iconset"
 iconutil --convert icns "$stage/PonteDesk.iconset" --output "$app/Contents/Resources/PonteDesk.icns"
@@ -40,6 +41,7 @@ ditto --norsrc --noextattr --qtn "$app" "$published/Ponte Desk.app"
 xattr -dr com.apple.FinderInfo "$published/Ponte Desk.app" 2>/dev/null || true
 xattr -dr com.apple.ResourceFork "$published/Ponte Desk.app" 2>/dev/null || true
 codesign --verify --deep --strict "$published/Ponte Desk.app"
+sh "$project_dir/scripts/test-macos-storage-package.sh" "$published/Ponte Desk.app"
 if [ -e "$output_dir/Ponte Desk.app" ]; then
   mv "$output_dir/Ponte Desk.app" "$output_dir/Ponte Desk.previous.$(date +%s).app"
 fi

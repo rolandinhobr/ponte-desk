@@ -187,7 +187,10 @@ final class PonteStorageController: NSObject {
             if let error = result["error"] as? String { self.fail(error); return }
             let detail = result["message"] as? String ?? "Ative Compartilhamento de Arquivos e habilite seu usuário nas opções SMB dos Ajustes do Sistema."
             self.message(detail, error: result["ready"] as? Bool != true)
-            if result["approval_required"] as? Bool == true {
+            if result["installer_required"] as? Bool == true {
+                let package=Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/PonteDeskStorage.pkg")
+                guard FileManager.default.fileExists(atPath:package.path),NSWorkspace.shared.open(package) else{self.fail("Não foi possível abrir o instalador do componente de cartões.");return}
+            } else if result["approval_required"] as? Bool == true {
                 self.message(detail + " Autorize também o auxiliar em Itens de Início de Sessão e Extensões.")
                 SMAppService.openSystemSettingsLoginItems()
             } else if result["ready"] as? Bool == true,
