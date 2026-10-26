@@ -79,7 +79,9 @@ impl Emulation for WindowsEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.kill_repeat_task();
+    }
 }
 
 impl WindowsEmulation {
@@ -105,11 +107,10 @@ impl WindowsEmulation {
 
 fn send_input_safe(input: INPUT) {
     unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
-            }
+        // Protected/elevated desktops can reject SendInput. Never spin on
+        // that failure: it would pin a CPU core and block the service loop.
+        if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) == 0 {
+            log::debug!("SendInput rejected; retaining local OS control");
         }
     }
 }
@@ -134,7 +135,7 @@ fn rel_mouse(dx: i32, dy: i32) {
         mouseData: 0,
         dwFlags: MOUSEEVENTF_MOVE,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: 0x4c4d_4252, // Lan Mouse integration tag (input-capture/input_origin.rs)
     };
     send_mouse_input(mi);
 }
@@ -170,7 +171,7 @@ fn mouse_button(button: u32, state: u32) {
         mouseData: mouse_data,
         dwFlags: dw_flags,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: 0x4c4d_4252, // Lan Mouse integration tag (input-capture/input_origin.rs)
     };
     send_mouse_input(mi);
 }
@@ -187,7 +188,7 @@ fn scroll(axis: u8, value: i32) {
         mouseData: -value as u32,
         dwFlags: event_type,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: 0x4c4d_4252, // Lan Mouse integration tag (input-capture/input_origin.rs)
     };
     send_mouse_input(mi);
 }
@@ -211,7 +212,7 @@ fn key_event(key: u32, state: u8) {
         wScan: scancode,
         dwFlags: flags,
         time: 0,
-        dwExtraInfo: 0,
+        dwExtraInfo: 0x4c4d_4252, // Lan Mouse integration tag (input-capture/input_origin.rs)
     };
     send_keyboard_input(ki);
 }

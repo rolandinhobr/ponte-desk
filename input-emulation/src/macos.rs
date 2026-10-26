@@ -57,6 +57,18 @@ fn drag_event_type(button: u32) -> CGEventType {
     }
 }
 
+// Protocol axes use positive down/right; Quartz wheel deltas use positive
+// up/left. This conversion applies only to received input, never local devices
+// or the user's macOS natural-scrolling preference.
+fn quartz_scroll_wheels(axis: u8, value: i32) -> Option<(u32, i32, i32, i32)> {
+    let delta = value.saturating_neg();
+    match axis {
+        0 => Some((1, delta, 0, 0)),
+        1 => Some((2, 0, delta, 0)),
+        _ => None,
+    }
+}
+
 unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
@@ -421,13 +433,11 @@ impl Emulation for MacOSEmulation {
                         value,
                     } => {
                         let value = value as i32;
-                        let (count, wheel1, wheel2, wheel3) = match axis {
-                            0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
-                            _ => {
-                                log::warn!("invalid scroll event: {axis}, {value}");
-                                return Ok(());
-                            }
+                        let Some((count, wheel1, wheel2, wheel3)) =
+                            quartz_scroll_wheels(axis, value)
+                        else {
+                            log::warn!("invalid scroll event: {axis}, {value}");
+                            return Ok(());
                         };
                         let event = match CGEvent::new_scroll_event(
                             self.event_source.clone(),
@@ -447,13 +457,11 @@ impl Emulation for MacOSEmulation {
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
-                        let (count, wheel1, wheel2, wheel3) = match axis {
-                            0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
-                            _ => {
-                                log::warn!("invalid scroll event: {axis}, {value}");
-                                return Ok(());
-                            }
+                        let Some((count, wheel1, wheel2, wheel3)) =
+                            quartz_scroll_wheels(axis, value / (120 / LINES_PER_STEP))
+                        else {
+                            log::warn!("invalid scroll event: {axis}, {value}");
+                            return Ok(());
                         };
                         let event = match CGEvent::new_scroll_event(
                             self.event_source.clone(),
@@ -607,5 +615,68 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod scroll_direction_tests {
+    use super::*;
+
+    // A Windows wheel-up delta (+120) is sent as -120. Verify the actual
+    // Quartz event encodes up (+3 lines), and down follows the reverse path.
+    // Events are inspected in memory and never posted to the user's desktop.
+    #[test]
+    fn windows_vertical_wheel_preserves_direction_in_quartz_event() {
+        for windows_delta in [-120, 120] {
+            let protocol_delta = -windows_delta;
+            let (count, y, x, z) = quartz_scroll_wheels(0, protocol_delta / 40).unwrap();
+            let event = CGEvent::new_scroll_event(
+                CGEventSource::new(CGEventSourceStateID::CombinedSessionState).unwrap(),
+                ScrollEventUnit::LINE,
+                count,
+                y,
+                x,
+                z,
+            )
+            .unwrap();
+            assert_eq!(
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
+                i64::from(windows_delta / 40)
+            );
+            assert_eq!(
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_and_pixel_scroll_use_the_same_protocol_direction() {
+        for axis in [0, 1] {
+            for delta in [-24, 0, 24] {
+                let (count, y, x, z) = quartz_scroll_wheels(axis, delta).unwrap();
+                let event = CGEvent::new_scroll_event(
+                    CGEventSource::new(CGEventSourceStateID::CombinedSessionState).unwrap(),
+                    ScrollEventUnit::PIXEL,
+                    count,
+                    y,
+                    x,
+                    z,
+                )
+                .unwrap();
+                let field = if axis == 0 {
+                    EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1
+                } else {
+                    EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2
+                };
+                assert_eq!(event.get_integer_value_field(field), -i64::from(delta));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_axis_is_rejected_and_extreme_delta_does_not_overflow() {
+        assert_eq!(quartz_scroll_wheels(2, 120), None);
+        assert_eq!(quartz_scroll_wheels(0, i32::MIN), Some((1, i32::MAX, 0, 0)));
     }
 }

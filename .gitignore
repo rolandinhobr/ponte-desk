@@ -12,3 +12,14 @@ extfile.conf
 # flatpak files
 .flatpak-builder
 repo
+
+/dist
+__pycache__/
+
+# Runtime identities and local-only development data
+.DS_Store
+observer.json
+preferences.json
+peer-preferences.json
+agent-leases/
+*.log

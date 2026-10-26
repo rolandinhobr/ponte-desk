@@ -68,6 +68,7 @@ pub(crate) enum EmulationEvent {
 
 enum EmulationRequest {
     Reenable,
+    Suspend(bool),
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
@@ -77,8 +78,9 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        start_suspended: bool,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend);
+        let emulation_proxy = EmulationProxy::new(backend, start_suspended);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -104,6 +106,12 @@ impl Emulation {
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(EmulationRequest::Reenable)
+            .expect("channel closed");
+    }
+
+    pub(crate) fn suspend(&self, suspended: bool) {
+        self.request_tx
+            .send(EmulationRequest::Suspend(suspended))
             .expect("channel closed");
     }
 
@@ -149,6 +157,10 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
+                                if !self.emulation_proxy.emulation_active.get() {
+                                    self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                                    continue;
+                                }
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
@@ -197,6 +209,7 @@ impl ListenTask {
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
+                    EmulationRequest::Suspend(value) => self.emulation_proxy.suspend(value),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
                     EmulationRequest::ChangePort(port) => {
@@ -240,10 +253,11 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    Suspend(bool),
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>) -> Self {
+    fn new(backend: Option<input_emulation::Backend>, start_suspended: bool) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
@@ -255,6 +269,7 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            suspended: start_suspended,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -298,6 +313,15 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn suspend(&self, suspended: bool) {
+        if suspended {
+            self.emulation_active.set(false);
+        }
+        self.request_tx
+            .send(ProxyRequest::Suspend(suspended))
+            .expect("channel closed");
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -314,13 +338,16 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    suspended: bool,
 }
 
 impl EmulationTask {
     async fn run(mut self) {
         loop {
-            if let Err(e) = self.do_emulation().await {
-                log::warn!("input emulation exited: {e}");
+            if !self.suspended {
+                if let Err(e) = self.do_emulation().await {
+                    log::warn!("input emulation exited: {e}");
+                }
             }
             if self.exit_requested.get() {
                 break;
@@ -328,7 +355,14 @@ impl EmulationTask {
             // wait for reenable request
             loop {
                 match self.request_rx.recv().await.expect("channel closed") {
-                    ProxyRequest::Reenable => break,
+                    ProxyRequest::Reenable if !self.suspended => break,
+                    ProxyRequest::Reenable => {}
+                    ProxyRequest::Suspend(value) => {
+                        self.suspended = value;
+                        if !value {
+                            break;
+                        }
+                    }
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
@@ -404,6 +438,11 @@ impl EmulationTask {
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
+                    ProxyRequest::Suspend(true) => {
+                        self.suspended = true;
+                        break Ok(());
+                    },
+                    ProxyRequest::Suspend(false) => {},
                 },
             }
         }
@@ -426,6 +465,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::Suspend(_) => continue,
         }
     }
 }

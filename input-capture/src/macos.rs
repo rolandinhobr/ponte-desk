@@ -38,6 +38,35 @@ use tokio::sync::{
     oneshot,
 };
 
+// Device-specific modifier masks from the macOS SDK's
+// IOKit/hidsystem/IOLLEvent.h. Aggregate CGEventFlagShift/Alternate/etc.
+// cannot distinguish releasing one side while the other remains held.
+const NX_DEVICELCTLKEYMASK: u64 = 0x0000_0001;
+const NX_DEVICELSHIFTKEYMASK: u64 = 0x0000_0002;
+const NX_DEVICERSHIFTKEYMASK: u64 = 0x0000_0004;
+const NX_DEVICELCMDKEYMASK: u64 = 0x0000_0008;
+const NX_DEVICERCMDKEYMASK: u64 = 0x0000_0010;
+const NX_DEVICELALTKEYMASK: u64 = 0x0000_0020;
+const NX_DEVICERALTKEYMASK: u64 = 0x0000_0040;
+const NX_DEVICERCTLKEYMASK: u64 = 0x0000_2000;
+
+fn mac_modifier_key_down(mac_keycode: u16, flags: u64) -> Option<bool> {
+    // Virtual keycodes from HIToolbox/Events.h; Caps Lock/Fn retain their
+    // existing handling because their flags do not describe these eight keys.
+    let mask = match mac_keycode {
+        0x36 => NX_DEVICERCMDKEYMASK,
+        0x37 => NX_DEVICELCMDKEYMASK,
+        0x38 => NX_DEVICELSHIFTKEYMASK,
+        0x3a => NX_DEVICELALTKEYMASK,
+        0x3b => NX_DEVICELCTLKEYMASK,
+        0x3c => NX_DEVICERSHIFTKEYMASK,
+        0x3d => NX_DEVICERALTKEYMASK,
+        0x3e => NX_DEVICERCTLKEYMASK,
+        _ => return None,
+    };
+    Some(flags & mask != 0)
+}
+
 #[derive(Debug, Default)]
 struct Bounds {
     xmin: f64,
@@ -58,6 +87,7 @@ struct InputCaptureState {
     bounds: Bounds,
     /// current state of modifier keys
     modifier_state: XMods,
+    software_moved_cursor: bool,
 }
 
 #[derive(Debug)]
@@ -78,6 +108,7 @@ impl InputCaptureState {
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
+            software_moved_cursor: false,
         };
         res.update_bounds()?;
         Ok(res)
@@ -105,6 +136,9 @@ impl InputCaptureState {
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
+        // Recompute bounds after an external display disappears so the return
+        // barrier remains reachable on the displays that are still active.
+        self.bounds = Bounds::default();
         active_ids.iter().for_each(|d| {
             let bounds = CGDisplay::new(*d).bounds();
             self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
@@ -268,8 +302,13 @@ fn get_events(
                 mods_locked |= XMods::LockMask;
             }
 
-            // check if pressed or released
-            let state = if depressed > *modifier_state { 1 } else { 0 };
+            // Inspect the key that changed, without requiring a prior event.
+            // Capture can start while modifiers are already held; comparing
+            // aggregate masks would turn some releases into fresh presses.
+            let mac_keycode = ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+            let state = mac_modifier_key_down(mac_keycode, cg_flags.bits())
+                .map(u8::from)
+                .unwrap_or_else(|| if depressed > *modifier_state { 1 } else { 0 });
             *modifier_state = depressed;
 
             if let Ok(key) = map_key(ev) {
@@ -405,6 +444,72 @@ fn get_events(
     Ok(())
 }
 
+#[cfg(test)]
+mod modifier_state_tests {
+    use super::*;
+
+    #[test]
+    fn releasing_alt_after_capture_starts_with_control_held_is_not_an_alt_press() {
+        let flags = CGEventFlags::CGEventFlagControl.bits() | NX_DEVICELCTLKEYMASK;
+        // No previous captured FlagsChanged event is required to recognize
+        // this Right Option release while Left Control remains down.
+        assert_eq!(mac_modifier_key_down(0x3d, flags), Some(false));
+        assert_eq!(mac_modifier_key_down(0x3b, flags), Some(true));
+    }
+
+    #[test]
+    fn each_modifier_side_remains_independent_when_the_other_side_is_held() {
+        for (left, right, group, left_mask, right_mask) in [
+            (
+                0x38,
+                0x3c,
+                CGEventFlags::CGEventFlagShift,
+                NX_DEVICELSHIFTKEYMASK,
+                NX_DEVICERSHIFTKEYMASK,
+            ),
+            (
+                0x3b,
+                0x3e,
+                CGEventFlags::CGEventFlagControl,
+                NX_DEVICELCTLKEYMASK,
+                NX_DEVICERCTLKEYMASK,
+            ),
+            (
+                0x3a,
+                0x3d,
+                CGEventFlags::CGEventFlagAlternate,
+                NX_DEVICELALTKEYMASK,
+                NX_DEVICERALTKEYMASK,
+            ),
+            (
+                0x37,
+                0x36,
+                CGEventFlags::CGEventFlagCommand,
+                NX_DEVICELCMDKEYMASK,
+                NX_DEVICERCMDKEYMASK,
+            ),
+        ] {
+            let left_only = group.bits() | left_mask;
+            assert_eq!(mac_modifier_key_down(left, left_only), Some(true));
+            assert_eq!(mac_modifier_key_down(right, left_only), Some(false));
+            let both = left_only | right_mask;
+            assert_eq!(mac_modifier_key_down(left, both), Some(true));
+            assert_eq!(mac_modifier_key_down(right, both), Some(true));
+            let right_only = group.bits() | right_mask;
+            assert_eq!(mac_modifier_key_down(left, right_only), Some(false));
+            assert_eq!(mac_modifier_key_down(right, right_only), Some(true));
+            assert_eq!(mac_modifier_key_down(right, 0), Some(false));
+        }
+    }
+
+    #[test]
+    fn caps_lock_function_and_regular_keys_keep_the_existing_path() {
+        for code in [0x39, 0x3f, 0x00] {
+            assert_eq!(mac_modifier_key_down(code, u64::MAX), None);
+        }
+    }
+}
+
 fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
     notify_tx: Sender<ProducerEvent>,
@@ -489,6 +594,40 @@ fn create_event_tap<'a>(
                 .unwrap_or_else(|e| {
                     log::error!("Failed to send notification: {e}");
                 });
+            return CallbackResult::Keep;
+        }
+
+        let source_pid = cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
+        if crate::input_origin::mac_event_is_software(source_pid)
+            && source_pid != i64::from(std::process::id())
+        {
+            crate::input_origin::record_software_event();
+            if matches!(
+                event_type,
+                CGEventType::MouseMoved
+                    | CGEventType::LeftMouseDragged
+                    | CGEventType::RightMouseDragged
+                    | CGEventType::OtherMouseDragged
+            ) {
+                state.software_moved_cursor = true;
+            }
+            return CallbackResult::Keep;
+        }
+
+        // A software warp to a screen edge must not turn the user's first
+        // physical movement into an unintended crossing to the other host.
+        if state.current_pos.is_none()
+            && state.software_moved_cursor
+            && matches!(event_type, CGEventType::MouseMoved)
+        {
+            let p = cg_ev.location();
+            if p.x > state.bounds.xmin + 3.0
+                && p.x < state.bounds.xmax - 3.0
+                && p.y > state.bounds.ymin + 3.0
+                && p.y < state.bounds.ymax - 3.0
+            {
+                state.software_moved_cursor = false;
+            }
             return CallbackResult::Keep;
         }
 

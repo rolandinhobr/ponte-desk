@@ -1,0 +1,13 @@
+{
+  "local_name": "Mac",
+  "peer_name": "Windows",
+  "shared_monitor": false,
+  "manage_displays": false,
+  "protect_windows_fullscreen": true,
+  "protect_mac_fullscreen": true,
+  "webcam_enabled": true,
+  "windows_monitor": "",
+  "mac_monitor_uuid": "",
+  "mac_input": 0,
+  "pc_input": 0
+}

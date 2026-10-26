@@ -1,0 +1,151 @@
+//
+//  ClipLibraryTests.swift
+//  LiveLoopTests
+//
+//  CRUD, ordering, persistence and export for the clip library, exercised
+//  against a temporary directory.
+//
+
+import XCTest
+
+@MainActor
+final class ClipLibraryTests: XCTestCase {
+
+    private var tempDir: URL!
+
+    override func setUp() async throws {
+        tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LiveLoopTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    }
+
+    override func tearDown() async throws {
+        try? FileManager.default.removeItem(at: tempDir)
+    }
+
+    /// Writes a throwaway file that stands in for a recorded clip.
+    private func makeTempFile(_ bytes: String = "video") -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rec-\(UUID().uuidString).mov")
+        try? bytes.data(using: .utf8)!.write(to: url)
+        return url
+    }
+
+    func testAddAndPersist() throws {
+        let library = ClipLibrary(directory: tempDir)
+        XCTAssertTrue(library.clips.isEmpty)
+
+        let clip = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "First", duration: 5))
+        XCTAssertEqual(library.clips.count, 1)
+        XCTAssertTrue(library.exists(clip))
+
+        // A fresh instance must load the persisted metadata.
+        let reloaded = ClipLibrary(directory: tempDir)
+        XCTAssertEqual(reloaded.clips.count, 1)
+        XCTAssertEqual(reloaded.clips.first?.name, "First")
+    }
+
+    func testPinnedSortFirst() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let a = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "A", duration: 1))
+        let b = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "B", duration: 1))
+
+        library.setPinned(a, true)
+        XCTAssertEqual(library.clips.first?.id, a.id, "pinned clip sorts first")
+        XCTAssertEqual(library.clips.last?.id, b.id)
+    }
+
+    func testRename() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let clip = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "Old", duration: 1))
+        library.rename(clip, to: "New")
+        XCTAssertEqual(library.clips.first?.name, "New")
+    }
+
+    func testDeleteRemovesFileAndEntry() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let clip = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "Temp", duration: 1))
+        let path = library.url(for: clip).path
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+
+        library.delete(clip)
+        XCTAssertTrue(library.clips.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+    }
+
+    func testRestoreBringsBackDeletedClip() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let clip = try XCTUnwrap(library.add(movingFileAt: makeTempFile("keep"), name: "Undo", duration: 1))
+        let path = library.url(for: clip).path
+
+        library.delete(clip)
+        XCTAssertTrue(library.clips.isEmpty)
+
+        XCTAssertTrue(library.restore(clip), "restore should succeed while the file is still in the trash")
+        XCTAssertEqual(library.clips.map(\.id), [clip.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        XCTAssertEqual(try String(contentsOf: library.url(for: clip), encoding: .utf8), "keep")
+    }
+
+    func testTrashIsClearedOnRelaunch() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let clip = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "Gone", duration: 1))
+        library.delete(clip)
+
+        // A fresh library (new session) empties the trash, so the deletion is final.
+        let relaunched = ClipLibrary(directory: tempDir)
+        XCTAssertFalse(relaunched.restore(clip), "a clip deleted in a previous session is not recoverable")
+        XCTAssertTrue(relaunched.clips.isEmpty)
+    }
+
+    func testExportCopiesFile() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let clip = try XCTUnwrap(library.add(movingFileAt: makeTempFile("payload"), name: "Exp", duration: 1))
+        let destination = tempDir.appendingPathComponent("exported.mov")
+        try library.export(clip, to: destination)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "payload")
+    }
+
+    func testDropsEntriesWithMissingFiles() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let clip = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "Ghost", duration: 1))
+        // Delete the underlying file behind the library's back.
+        try FileManager.default.removeItem(at: library.url(for: clip))
+
+        let reloaded = ClipLibrary(directory: tempDir)
+        XCTAssertTrue(reloaded.clips.isEmpty, "entries without files are pruned on load")
+    }
+
+    func testLoopSequenceIsTheClipAloneOutsideAPlaylist() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let a = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "A", duration: 1))
+        let b = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "B", duration: 1))
+        library.setInPlaylist(a, true)   // a one-clip playlist is no playlist
+        XCTAssertEqual(library.loopSequence(startingAt: a).map(\.id), [a.id])
+        library.setInPlaylist(b, true)
+        let c = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "C", duration: 1))
+        XCTAssertEqual(library.loopSequence(startingAt: c).map(\.id), [c.id], "C isn't in the playlist")
+    }
+
+    func testLoopSequenceStartsAtTheSelectedPlaylistClip() throws {
+        let library = ClipLibrary(directory: tempDir)
+        let a = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "A", duration: 1))
+        let b = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "B", duration: 1))
+        let c = try XCTUnwrap(library.add(movingFileAt: makeTempFile(), name: "C", duration: 1))
+        for clip in [a, b, c] { library.setInPlaylist(clip, true) }
+        let order = library.clips.map(\.id)   // newest first: C, B, A
+        XCTAssertEqual(library.loopSequence(startingAt: b).map(\.id), [order[1], order[2], order[0]])
+
+        let reloaded = ClipLibrary(directory: tempDir)
+        XCTAssertTrue(reloaded.clips.allSatisfy(\.inPlaylist), "playlist membership persists")
+    }
+
+    func testDecodesLibrariesSavedBeforePlaylists() throws {
+        let json = """
+        [{"id":"\(UUID().uuidString)","name":"Old","fileName":"x.mov","durationSeconds":3,
+          "createdAt":0,"pinned":false}]
+        """
+        let clips = try JSONDecoder().decode([Clip].self, from: Data(json.utf8))
+        XCTAssertEqual(clips.first?.inPlaylist, false)
+    }
+}

@@ -10,12 +10,14 @@ members = [
 ]
 
 [package]
-name = "lan-mouse"
-description = "Software KVM Switch / mouse & keyboard sharing software for Local Area Networks"
-version = "0.11.0"
+name = "ponte-desk"
+description = "Integrated local keyboard, mouse and shared display control"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/feschber/lan-mouse"
+
+[lib]
+name = "lan_mouse"
 
 [profile.release]
 codegen-units = 1
@@ -66,6 +68,8 @@ rustls = { version = "0.23.12", default-features = false, features = [
 ] }
 rcgen = "0.13.1"
 sha2 = "0.10.8"
+hmac = "0.12.1"
+pem = "3.0.6"
 notify = "8.2.0"
 
 [target.'cfg(unix)'.dependencies]
@@ -92,9 +96,9 @@ x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
-name = "Lan Mouse"
+name = "Ponte Desk"
 icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
-identifier = "de.feschber.LanMouse"
+identifier = "br.com.ponte-desk.app"
 deb_depends = [ "libadwaita-1-0" ]
 resources = ["target/menubar-template.png"]
 

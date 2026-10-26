@@ -297,6 +297,9 @@ pub enum SocketPathError {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
+    if let Some(path) = env::var_os("LAN_MOUSE_SOCKET_PATH") {
+        return Ok(PathBuf::from(path));
+    }
     let xdg_runtime_dir =
         env::var("XDG_RUNTIME_DIR").map_err(SocketPathError::XdgRuntimeDirNotFound)?;
     Ok(Path::new(xdg_runtime_dir.as_str()).join(LAN_MOUSE_SOCKET_NAME))
@@ -304,11 +307,24 @@ pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
 
 #[cfg(all(unix, target_os = "macos"))]
 pub fn default_socket_path() -> Result<PathBuf, SocketPathError> {
+    if let Some(path) = env::var_os("LAN_MOUSE_SOCKET_PATH") {
+        return Ok(PathBuf::from(path));
+    }
     let home = env::var("HOME").map_err(SocketPathError::HomeDirNotFound)?;
     Ok(Path::new(home.as_str())
         .join("Library")
         .join("Caches")
         .join(LAN_MOUSE_SOCKET_NAME))
+}
+
+#[cfg(windows)]
+pub fn local_ipc_address() -> std::net::SocketAddrV4 {
+    let port = std::env::var("LAN_MOUSE_IPC_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|&p| p != 0)
+        .unwrap_or(5252);
+    std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port)
 }
 
 /// Check if a lan-mouse service is already running by probing the IPC socket.
@@ -323,5 +339,5 @@ pub fn is_service_running() -> bool {
 /// Check if a lan-mouse service is already running by probing the IPC socket.
 #[cfg(windows)]
 pub fn is_service_running() -> bool {
-    std::net::TcpStream::connect("127.0.0.1:5252").is_ok()
+    std::net::TcpStream::connect(crate::local_ipc_address()).is_ok()
 }

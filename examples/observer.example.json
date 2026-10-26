@@ -1,0 +1,7 @@
+{
+  "side": "mac",
+  "key": "REPLACE_WITH_64_HEX_CHARACTERS_SHARED_ONLY_BY_THE_TWO_COMPUTERS",
+  "peers": ["192.0.2.20"],
+  "port": 4243,
+  "bind_address": "0.0.0.0"
+}

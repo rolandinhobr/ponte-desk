@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -73,6 +73,7 @@ pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    pressed_buttons: HashMap<EmulationHandle, HashSet<u32>>,
 }
 
 impl InputEmulation {
@@ -96,6 +97,7 @@ impl InputEmulation {
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
         })
     }
 
@@ -142,6 +144,16 @@ impl InputEmulation {
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         match event {
+            Event::Pointer(PointerEvent::Button { button, state, .. }) => {
+                if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
+                    if state == 0 {
+                        buttons.remove(&button);
+                    } else {
+                        buttons.insert(button);
+                    }
+                }
+                self.emulation.consume(event, handle).await
+            }
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // prevent double pressed / released keys
                 if self.update_pressed_keys(handle, key, state) {
@@ -156,6 +168,7 @@ impl InputEmulation {
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
+            self.pressed_buttons.insert(handle, HashSet::new());
             self.emulation.create(handle).await;
             true
         } else {
@@ -167,6 +180,7 @@ impl InputEmulation {
         let _ = self.release_keys(handle).await;
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            self.pressed_buttons.remove(&handle);
             self.emulation.destroy(handle).await
         }
     }
@@ -179,6 +193,20 @@ impl InputEmulation {
     }
 
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
+            for button in buttons.drain().collect::<Vec<_>>() {
+                self.emulation
+                    .consume(
+                        Event::Pointer(PointerEvent::Button {
+                            time: 0,
+                            button,
+                            state: 0,
+                        }),
+                        handle,
+                    )
+                    .await?;
+            }
+        }
         if let Some(keys) = self.pressed_keys.get_mut(&handle) {
             let keys = keys.drain().collect::<Vec<_>>();
             for key in keys {
@@ -237,4 +265,77 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    struct Recorder(Arc<Mutex<Vec<Event>>>);
+    #[async_trait]
+    impl Emulation for Recorder {
+        async fn consume(
+            &mut self,
+            event: Event,
+            _: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+        async fn create(&mut self, _: EmulationHandle) {}
+        async fn destroy(&mut self, _: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+    }
+    #[tokio::test]
+    async fn suspension_cleanup_releases_drag_and_modifier_before_destroy() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut input = InputEmulation {
+            emulation: Box::new(Recorder(events.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        };
+        input.create(0).await;
+        input
+            .consume(
+                Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: input_event::BTN_LEFT,
+                    state: 1,
+                }),
+                0,
+            )
+            .await
+            .unwrap();
+        input
+            .consume(
+                Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: 29,
+                    state: 1,
+                }),
+                0,
+            )
+            .await
+            .unwrap();
+        input.terminate().await;
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Pointer(PointerEvent::Button {
+                button: input_event::BTN_LEFT,
+                state: 0,
+                ..
+            })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Keyboard(KeyboardEvent::Key {
+                key: 29,
+                state: 0,
+                ..
+            })
+        )));
+        assert!(input.handles.is_empty());
+    }
 }

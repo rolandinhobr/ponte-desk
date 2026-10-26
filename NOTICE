@@ -1,0 +1,23 @@
+Ponte Desk is a fork of Lan Mouse, licensed GPL-3.0-or-later.
+Upstream: https://github.com/feschber/lan-mouse
+Fork base: f1b96bdcc0294d285bc9050b7e146800a3ef8796
+Original authors retain all copyright and credit. See LICENSE and upstream Git history.
+Ponte Desk adds in-process LAN coordination, input-origin filtering, cooperative
+agent isolation, automatic shared-display management and native macOS UI.
+The display-enable API was researched using Vorssaint (GPL-3.0):
+https://github.com/vorssaint/vorssaint-utils
+The implementation in native/macos/PonteDesk.swift is specific to this project.
+
+Webcam module additions:
+- CMIO producer protocol researched using VirtualCamera4Mac v0.0.7
+  (Apache-2.0), m96-chan/VirtualCamera4Mac. This earlier system component
+  is not bundled in release 0.3; the producer retains its provenance notice.
+- Windows Media Foundation source derived from smourier/VCamSample (MIT),
+  Microsoft WIL (MIT) and C++/WinRT (MIT); full notices in native/windows/webcam/.
+
+macOS camera component (public release 0.3):
+LiveLoop 1.3.4, Copyright (C) 2026 adrbn, GPL-3.0.
+https://github.com/adrbn/liveloop/tree/v1.3.4
+The original signed host and extension are redistributed without modification.
+Runtime CMIO properties customize the public device name and off-air artwork.
+Corresponding source is included in native/macos/camera-extension/vendor-source.

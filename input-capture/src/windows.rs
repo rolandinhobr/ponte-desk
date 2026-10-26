@@ -7,14 +7,15 @@ use std::pin::Pin;
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
 
-use super::{Capture, CaptureError, CaptureEvent, Position};
+use super::{Capture, CaptureCreationError, CaptureError, CaptureEvent, Position};
 
 mod display_util;
 mod event_thread;
 
 pub struct WindowsInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    // Stop callbacks and join their thread before closing the event consumer.
     event_thread: EventThread,
+    event_rx: Receiver<(Position, CaptureEvent)>,
 }
 
 #[async_trait]
@@ -40,13 +41,13 @@ impl Capture for WindowsInputCapture {
 }
 
 impl WindowsInputCapture {
-    pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
-        let event_thread = EventThread::new(event_tx);
-        Self {
+    pub(crate) fn new() -> Result<Self, CaptureCreationError> {
+        let (event_tx, event_rx) = channel(128);
+        let event_thread = EventThread::new(event_tx)?;
+        Ok(Self {
             event_thread,
             event_rx,
-        }
+        })
     }
 }
 

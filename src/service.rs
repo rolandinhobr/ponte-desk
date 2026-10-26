@@ -67,6 +67,7 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    integration: crate::integration::Guard,
 }
 
 #[derive(Debug)]
@@ -98,9 +99,15 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        let integration = crate::integration::Guard::new();
+        let capture = Capture::new(
+            capture_backend,
+            conn,
+            config.release_bind(),
+            !integration.policy.capture,
+        );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, listener, !integration.policy.emulation);
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -123,11 +130,15 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            integration,
         };
         Ok(service)
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
+        let _webcam_receiver = crate::webcam::start_receiver();
+        let mut guard_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        guard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let active = self.client_manager.active_clients();
         for handle in active.iter() {
             // small hack: `activate_client()` checks, if the client
@@ -142,6 +153,15 @@ impl Service {
 
         loop {
             tokio::select! {
+                _ = guard_tick.tick() => {
+                    let changed = self.integration.refresh();
+                    if changed {
+                        log::info!("integration: {}", self.integration.policy.reason);
+                        self.capture.suspend(!self.integration.policy.capture);
+                        self.emulation.suspend(!self.integration.policy.emulation);
+                    }
+                    self.integration.write_status(self.capture_status.into(), self.emulation_status.into(), changed);
+                },
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
@@ -186,8 +206,13 @@ impl Service {
                 self.remove_client(handle);
                 self.save_config();
             }
-            FrontendRequest::EnableCapture => self.capture.reenable(),
-            FrontendRequest::EnableEmulation => self.emulation.reenable(),
+            FrontendRequest::EnableCapture if self.integration.policy.capture => {
+                self.capture.reenable()
+            }
+            FrontendRequest::EnableEmulation if self.integration.policy.emulation => {
+                self.emulation.reenable()
+            }
+            FrontendRequest::EnableCapture | FrontendRequest::EnableEmulation => {}
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
@@ -310,10 +335,14 @@ impl Service {
             },
             EmulationEvent::EmulationDisabled => {
                 self.emulation_status = Status::Disabled;
+                self.integration
+                    .write_status(self.capture_status.into(), false, true);
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::EmulationEnabled => {
                 self.emulation_status = Status::Enabled;
+                self.integration
+                    .write_status(self.capture_status.into(), true, true);
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
@@ -345,10 +374,14 @@ impl Service {
             }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
+                self.integration
+                    .write_status(false, self.emulation_status.into(), true);
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::CaptureEnabled => {
                 self.capture_status = Status::Enabled;
+                self.integration
+                    .write_status(true, self.emulation_status.into(), true);
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::ClientEntered(handle) => {

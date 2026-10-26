@@ -1,0 +1,7 @@
+Ponte Desk Webcam Windows backend
+Derived from VCamSample by Simon Mourier (MIT).
+Upstream commit 58b6d4b0e0c2c97fdffd66d23e7c8da6b89f570d
+https://github.com/smourier/VCamSample
+Modified: custom CLSID/name, bounded JPEG memory transport, WIC frame decoding, 720p30 media types, CPU sample generation, integrated C ABI controller, explicit USB capture with asynchronous bounded MF samples, deferred shared-section creation during unelevated source probes.
+Upstream MIT license is included in LICENSE-VCamSample.txt.
+Microsoft WIL and C++/WinRT dependencies are MIT; licenses are included as LICENSE-WIL.txt and LICENSE-CppWinRT.txt.

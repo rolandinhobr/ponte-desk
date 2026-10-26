@@ -1,0 +1,729 @@
+//
+//  AppState.swift
+//  LiveLoop
+//
+//  The coordinator that wires the camera, loop engine, router, recorder,
+//  library, extension, hotkey and settings together and exposes a small,
+//  observable surface for the SwiftUI menu.
+//
+
+import Foundation
+import Combine
+import SwiftUI
+import AppKit
+import AVFoundation
+import CoreMedia
+import CoreVideo
+import Sparkle
+
+struct CameraOption: Identifiable, Hashable {
+    let id: String   // AVCaptureDevice.uniqueID
+    let name: String
+}
+
+/// A transient, user-facing status line so every meaningful action reports its
+/// outcome instead of succeeding or failing silently.
+struct AppBanner: Equatable {
+    enum Kind { case success, failure, info, working }
+    let kind: Kind
+    let text: String
+}
+
+@MainActor
+final class AppState: ObservableObject {
+
+    // Sub-systems the UI observes directly.
+    let settings = Settings()
+    let library = ClipLibrary()
+    let extensionManager = ExtensionManager()
+    /// Opt-in beta features (Settings ▸ Beta). All off by default.
+    let beta = BetaSettings()
+
+    // Observable UI state.
+    @Published private(set) var isEngaged = false
+    @Published private(set) var mode: FrameRouter.Mode = .idle
+    @Published private(set) var isRecording = false
+    /// True while a cold webcam starts up just before a recording begins.
+    @Published private(set) var isWarmingUp = false
+    /// The webcam is on but hasn't sent a frame yet (can take 10 s+ with
+    /// macOS Video Effects on). The panel shows a spinner meanwhile.
+    @Published private(set) var isCameraStarting = false
+    @Published private(set) var sinkConnected = false
+    @Published private(set) var extensionInstalled = false
+    @Published private(set) var cameras: [CameraOption] = []
+    @Published var selectedClipID: UUID?
+    @Published private(set) var loadingClip = false
+
+    /// Mirror of what the virtual camera is broadcasting (for the in-app preview).
+    let preview = PreviewRenderer()
+    /// Mirror of the real webcam — a self-view, useful while looping.
+    let livePreview = PreviewRenderer()
+    /// The same two mirrors for the bigger, floating preview window (a display
+    /// layer can only live in one view).
+    let windowPreview = PreviewRenderer()
+    let windowLivePreview = PreviewRenderer()
+
+    // Engine.
+    private let processingQueue = DispatchQueue(label: "com.adrbn.LiveLoop.processing", qos: .userInteractive)
+    private let pipeline = ImagePipeline()
+    private let publisher = SinkStreamPublisher()
+    private let camera: CameraCaptureManager
+    private let loopEngine: LoopEngine
+    private let router: FrameRouter
+    private let recorder: ClipRecorder
+    private let hotkeys = HotkeyManager()
+    /// Checks the appcast published with each GitHub release (SUFeedURL).
+    private let updater = SPUStandardUpdaterController(
+        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    private let liveFrameTap = LiveFrameTap()
+    private(set) lazy var betaController = BetaController(
+        host: self, settings: beta, modes: $mode.eraseToAnyPublisher(), liveFrameTap: liveFrameTap)
+    private var cancellables = Set<AnyCancellable>()
+    private var keyMonitor: Any?
+    /// The clips currently decoded into the loop engine (several for a playlist).
+    private var loadedClipIDs: [UUID] = []
+    private var loadedClipHasSignatures = false
+    /// Set once the OS confirms activation — trusted over CMIO device discovery,
+    /// which can lag inside a long-running process.
+    private var osConfirmedInstalled = false
+    /// One automatic retry per launch when the camera doesn't come back.
+    private var retriedActivation = false
+    /// Clips deleted this session, most-recent last — the ⌘Z undo stack.
+    private var deletionUndoStack: [Clip] = []
+    /// True when the current engagement was started automatically because a
+    /// meeting app opened the virtual camera — so it can be torn down when the
+    /// last consumer leaves, without disturbing a session the user started by hand.
+    private var engagedOnDemand = false
+    private var onDemandDisengageTask: Task<Void, Never>?
+    /// Who needs the real webcam. Tracked here, not read from the capture
+    /// session, whose start/stop land later on the processing queue.
+    private var webcam = WebcamClaims()
+
+    /// The menu-bar panel's hosting window (captured when it appears), used to
+    /// scope global key shortcuts to the panel and away from Settings.
+    weak var panelWindow: NSWindow?
+
+    /// Seconds left in the current recording (for the live countdown).
+    @Published private(set) var recordSecondsLeft = 0
+
+    /// The current user-facing status banner (nil when nothing to report).
+    @Published private(set) var banner: AppBanner?
+    private var bannerDismiss: Task<Void, Never>?
+
+    var isLoopActive: Bool { mode == .loop }
+
+    init() {
+        camera = CameraCaptureManager(queue: processingQueue)
+        loopEngine = LoopEngine(pipeline: pipeline, queue: processingQueue)
+        router = FrameRouter(pipeline: pipeline, publisher: publisher, queue: processingQueue)
+        recorder = ClipRecorder(queue: processingQueue)
+
+        router.loopEngine = loopEngine
+        router.onModeChange = { [weak self] mode in self?.mode = mode }
+
+        // Mirror every emitted frame into the in-app preview.
+        let preview = self.preview, windowPreview = self.windowPreview
+        router.onOutputFrame = { buffer in
+            DispatchQueue.main.async {
+                preview.enqueue(buffer)
+                windowPreview.enqueue(buffer)
+            }
+        }
+
+        // Fan every captured frame out to the router, recorder, and self-view.
+        let livePreview = self.livePreview, windowLivePreview = self.windowLivePreview
+        camera.onSampleBuffer = { [router, recorder, liveFrameTap] sampleBuffer in
+            router.handleLiveFrame(sampleBuffer)
+            recorder.append(sampleBuffer)
+            if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                DispatchQueue.main.async { [weak self] in
+                    if self?.isCameraStarting == true { self?.isCameraStarting = false }
+                    livePreview.enqueue(pixelBuffer)
+                    windowLivePreview.enqueue(pixelBuffer)
+                }
+                liveFrameTap.offer(pixelBuffer)   // no-op unless a beta feature listens
+            }
+        }
+
+        applyLagSettings()
+        observeSettings()
+        // Re-publish nested library changes so views observing AppState re-render
+        // (and animate) when clips are added, deleted, or restored.
+        library.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        observeExtensionStatus()
+        refreshCameras()
+        registerHotkey()
+
+        selectedClipID = library.clips.first?.id
+        refreshExtensionStatus()
+        upgradeExtensionIfNeeded()
+        // Keep "installed?" live: the virtual camera can appear/disappear while
+        // the app runs (install, reinstall, replace) — never cache it once.
+        SinkStreamPublisher.observeDeviceChanges { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.refreshExtensionStatus()
+                // A freshly installed camera doesn't know the name yet.
+                SinkStreamPublisher.setCameraName(LiveLoop.cameraName(from: self.settings.cameraName))
+            }
+        }
+        installClipKeyMonitor()
+        observeConsumerSignals()
+        observeAppTermination()
+        Self.purgeStaleRecordings()
+        _ = betaController
+    }
+
+    /// Feed the in-app previews only while the panel is on screen. A hidden
+    /// display layer never drains, so feeding it piles up raw frames without
+    /// bound (memory → swap → full disk). See `PreviewRenderer`.
+    func setPreviewsActive(_ active: Bool) {
+        preview.setActive(active)
+        livePreview.setActive(active)
+    }
+
+    /// Same rule for the floating preview window, which has its own lifetime.
+    func setWindowPreviewsActive(_ active: Bool) {
+        windowPreview.setActive(active)
+        windowLivePreview.setActive(active)
+    }
+
+    /// Stop the camera cleanly when the app quits (don't leave capture running).
+    private func observeAppTermination() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.disengage() }
+        }
+    }
+
+    /// Delete orphaned recording temp files a previous crash may have left behind.
+    nonisolated static func purgeStaleRecordings() {
+        let tmp = FileManager.default.temporaryDirectory
+        let files = (try? FileManager.default.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil)) ?? []
+        for file in files where file.lastPathComponent.hasPrefix("liveloop-") && file.pathExtension == "mov" {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    /// Keyboard shortcuts inside the open panel: ↑/↓ move between clips,
+    /// Backspace / Forward-delete removes the selected one. Only active while the
+    /// panel is open and never while a text field (inline rename) is being edited.
+    private func installClipKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.shortcutsActive else { return event }
+            if let responder = NSApp.keyWindow?.firstResponder,
+               responder is NSText || responder is NSTextView {
+                return event
+            }
+            // ⌘Z → undo the last delete. Match the *character*, not the keycode,
+            // so it works on any keyboard layout (on AZERTY the "z" key isn't the
+            // ANSI-Z keycode). ⌘⇧Z (redo) is intentionally left alone.
+            if event.modifierFlags.contains(.command),
+               !event.modifierFlags.contains(.shift),
+               event.charactersIgnoringModifiers?.lowercased() == "z" {
+                guard !self.deletionUndoStack.isEmpty else { return event }
+                self.undoDelete()
+                return nil
+            }
+            switch event.keyCode {
+            case 126: self.navigateClip(-1); return nil   // up arrow
+            case 125: self.navigateClip(1);  return nil   // down arrow
+            case 51, 117:                                 // delete / forward-delete
+                guard let clip = self.currentClip else { return event }
+                self.deleteClip(clip)
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    /// Key shortcuts (↑↓, ⌫, ⌘Z) fire only when the panel is the focused surface —
+    /// not while Settings or onboarding is up. A non-activating panel leaves the
+    /// app with no key window, which we also treat as "the panel".
+    private var shortcutsActive: Bool {
+        let key = NSApp.keyWindow
+        return key == nil || key === panelWindow
+    }
+
+    /// Move the selection up (delta -1) or down (delta +1) through the clip list.
+    private func navigateClip(_ delta: Int) {
+        let clips = library.clips
+        guard !clips.isEmpty else { return }
+        let current = clips.firstIndex { $0.id == selectedClipID } ?? (delta > 0 ? -1 : 0)
+        let next = max(0, min(clips.count - 1, current + delta))
+        selectedClipID = clips[next].id
+    }
+
+    /// Delete a clip with a leftward swipe-out, pushing it onto the ⌘Z undo stack.
+    func deleteClip(_ clip: Clip) {
+        let wasSelected = clip.id == selectedClipID
+        deletionUndoStack.append(clip)
+        animate { self.library.delete(clip) }
+        if wasSelected { selectedClipID = library.clips.first?.id }
+    }
+
+    /// Undo the most recent deletion (⌘Z): slide the clip back in and select it.
+    func undoDelete() {
+        guard let clip = deletionUndoStack.popLast() else { return }
+        var restored = false
+        animate { restored = self.library.restore(clip) }
+        if restored { selectedClipID = clip.id }
+    }
+
+    /// Run a state change inside an animation, honoring Reduce Motion.
+    private func animate(_ changes: () -> Void) {
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            changes()
+        } else {
+            // A spring eases in gently (unlike ease-out, which starts at full
+            // speed), so the rows below a deleted clip don't snap up and overlap.
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.9), changes)
+        }
+    }
+
+    // MARK: - Extension status
+
+    func refreshExtensionStatus() {
+        // Trust, in order: the OS's own "activated" confirmation, a live sink
+        // connection, then CMIO discovery (which can be stale in-process).
+        extensionInstalled = osConfirmedInstalled
+            || sinkConnected
+            || SinkStreamPublisher.deviceIsAvailable()
+    }
+
+    private func observeExtensionStatus() {
+        extensionManager.$status
+            .sink { [weak self] status in
+                guard let self else { return }
+                switch status {
+                case .needsApproval:
+                    self.notify(.info, "Approve LiveLoop in System Settings ▸ General ▸ Login Items & Extensions ▸ Camera Extensions.", sticky: true)
+                case .installed:
+                    // The OS confirmed activation — trust it immediately.
+                    self.osConfirmedInstalled = true
+                    self.extensionInstalled = true
+                    UserDefaults.standard.set(Self.appBuild, forKey: Self.extensionBuildKey)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        if self.isEngaged { self.reconnectSink() }
+                        // A replaced camera starts with the name it saved, which
+                        // an older build may never have received.
+                        SinkStreamPublisher.setCameraName(LiveLoop.cameraName(from: self.settings.cameraName))
+                    }
+                    // Replacing the extension sometimes leaves macOS with no
+                    // camera running at all; a second activation brings it back.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                        guard !self.retriedActivation, !SinkStreamPublisher.deviceIsAvailable() else { return }
+                        self.retriedActivation = true
+                        self.extensionManager.install()
+                    }
+                    self.notify(.success, "Virtual camera ready ✓")
+                case .removed:
+                    self.osConfirmedInstalled = false
+                    self.extensionInstalled = false
+                    self.notify(.info, "Virtual camera removed.")
+                case .failed(let message):
+                    self.notify(.failure, "Couldn’t set up the camera — \(message)", sticky: true)
+                case .installing, .unknown:
+                    break   // `installExtension`/`removeExtension` show the "working" banner
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Status banner
+
+    /// Report an outcome to the user. Non-sticky banners fade after a few
+    /// seconds; sticky ones (failures, "needs approval") stay until replaced.
+    func notify(_ kind: AppBanner.Kind, _ text: String, sticky: Bool = false) {
+        banner = AppBanner(kind: kind, text: text)
+        bannerDismiss?.cancel()
+        guard !sticky else { return }
+        bannerDismiss = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            if !Task.isCancelled { self?.banner = nil }
+        }
+    }
+
+    func dismissBanner() {
+        bannerDismiss?.cancel()
+        banner = nil
+    }
+
+    // MARK: - Engagement
+
+    func engage(onDemand: Bool = false) async {
+        guard !isEngaged else { return }
+        guard await requestCameraAccess() else {
+            if !onDemand {
+                notify(.failure, "Camera access denied — enable it in System Settings ▸ Privacy & Security ▸ Camera.", sticky: true)
+            }
+            return
+        }
+        engagedOnDemand = onDemand
+        reconnectSink()
+        // Already on for a clip: keep it (a restart would cut into the recording).
+        if webcam.claim(.virtualCamera) { startCamera(settings.selectedCameraID) }
+        router.engageLive()
+        isEngaged = true
+        // Started by hand, the LIVE badge says it all; only explain a camera
+        // that came on by itself.
+        if onDemand { notify(.info, "Camera on — an app opened LiveLoop.") }
+    }
+
+    func disengage() {
+        guard isEngaged else { return }
+        onDemandDisengageTask?.cancel()
+        onDemandDisengageTask = nil
+        engagedOnDemand = false
+        router.disengage()
+        // A recording in progress keeps the webcam; it turns off when that ends.
+        if webcam.release(.virtualCamera) { camera.stop() }
+        publisher.disconnect()
+        isEngaged = false
+        sinkConnected = false
+    }
+
+    // MARK: - Engage on demand
+
+    /// Bridges the extension's Darwin notifications to the app: the webcam comes
+    /// up when a meeting app opens LiveLoop and goes back down when the last one
+    /// leaves — so the camera light is only on while something is watching.
+    private func observeConsumerSignals() {
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        let callback: CFNotificationCallback = { _, observer, name, _, _ in
+            guard let observer, let name else { return }
+            let app = Unmanaged<AppState>.fromOpaque(observer).takeUnretainedValue()
+            let active = (name.rawValue as String) == LiveLoop.ConsumerSignal.active
+            Task { @MainActor in app.consumerDidChange(active: active) }
+        }
+        for signal in [LiveLoop.ConsumerSignal.active, LiveLoop.ConsumerSignal.inactive] {
+            CFNotificationCenterAddObserver(center, observer, callback,
+                                            signal as CFString, nil, .deliverImmediately)
+        }
+    }
+
+    func consumerDidChange(active: Bool) {
+        if active {
+            onDemandDisengageTask?.cancel()
+            onDemandDisengageTask = nil
+            Task { await engageOnDemand() }
+        } else {
+            scheduleOnDemandDisengage()
+        }
+    }
+
+    private func engageOnDemand() async {
+        guard !isEngaged else { return }
+        // Never provoke a permission prompt from the background — only auto-engage
+        // once the user has already granted camera access.
+        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return }
+        await engage(onDemand: true)
+    }
+
+    private func scheduleOnDemandDisengage() {
+        guard engagedOnDemand else { return }   // never tear down a manual session
+        onDemandDisengageTask?.cancel()
+        onDemandDisengageTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)   // brief grace for reconnects
+            guard let self, !Task.isCancelled else { return }
+            if self.engagedOnDemand { self.disengage() }
+        }
+    }
+
+    /// (Re)connects to the extension's sink stream. Safe to call repeatedly.
+    @discardableResult
+    func reconnectSink() -> Bool {
+        let state = publisher.connect()
+        sinkConnected = (state == .connected)
+        // Connecting to the sink is proof the extension is installed and live.
+        if sinkConnected { extensionInstalled = true }
+        return sinkConnected
+    }
+
+    // MARK: - Live / loop
+
+    func toggleLoopLive() {
+        Task {
+            if !isEngaged { await engage() }
+            if mode == .loop {
+                router.goToLive(smart: beta.smartSwitchEnabled, togglesPendingReturn: true)
+            } else {
+                await goToLoop()
+            }
+        }
+    }
+
+    func goToLoop() async {
+        guard let clip = currentClip ?? library.clips.first else { return }
+        // Ensure the *currently selected* clip is what's loaded (arrow-navigating
+        // changes the selection without eagerly decoding each clip's frames).
+        // Beta smart switch also needs the clip's pose signatures.
+        let needsSignatures = beta.smartSwitchEnabled && !loadedClipHasSignatures
+        let sequence = library.loopSequence(startingAt: clip).map(\.id)
+        if !loopEngine.isLoaded || loadedClipIDs != sequence || needsSignatures {
+            await loadClip(clip)
+        }
+        guard loopEngine.isLoaded else { return }
+        applyLagSettings()
+        router.goToLoop(smart: beta.smartSwitchEnabled)
+    }
+
+    func goToLive() {
+        router.goToLive(smart: beta.smartSwitchEnabled)
+    }
+
+    // MARK: - Clips
+
+    var currentClip: Clip? {
+        guard let id = selectedClipID else { return nil }
+        return library.clips.first { $0.id == id }
+    }
+
+    func selectClip(_ clip: Clip) {
+        selectedClipID = clip.id
+        Task { await loadClip(clip) }
+    }
+
+    /// Decodes `clip` — or, when it's in a playlist, every playlist clip — into the engine.
+    private func loadClip(_ clip: Clip) async {
+        loadingClip = true
+        defer { loadingClip = false }
+        let sequence = library.loopSequence(startingAt: clip)
+        var stores: [ClipFrameStore] = []
+        for item in sequence {
+            if let store = await ClipFrameLoader.load(url: library.url(for: item), pipeline: pipeline,
+                                                      withSignatures: beta.smartSwitchEnabled) {
+                stores.append(store)
+            }
+        }
+        guard !stores.isEmpty else { return }
+        let store = ClipFrameStore.joined(stores)
+        loopEngine.load(store)
+        loadedClipIDs = sequence.map(\.id)
+        loadedClipHasSignatures = !store.signatures.isEmpty
+    }
+
+    // MARK: - Recording
+
+    /// A cold webcam needs a moment to start and settle its exposure; recording
+    /// straight away would bake a dark first second into the loop.
+    private static let warmUpNanoseconds: UInt64 = 1_500_000_000
+    /// How long to wait for a cold webcam's first frame before giving up.
+    private static let firstFrameTimeout: Duration = .seconds(20)
+
+    /// Warming up or recording: the webcam is on for a clip.
+    var isCapturingClip: Bool { isRecording || isWarmingUp }
+
+    /// Works with the virtual camera off too: the webcam comes on just for the
+    /// clip (you see yourself in the panel) and goes off again afterwards.
+    func startRecording() {
+        guard !isCapturingClip else { return }
+        isWarmingUp = true   // also blocks a second start while we wait below
+        Task {
+            guard await requestCameraAccess() else {
+                isWarmingUp = false
+                notify(.failure, "Camera access denied — enable it in System Settings ▸ Privacy & Security ▸ Camera.", sticky: true)
+                return
+            }
+            let coldStart = webcam.claim(.clip)
+            if coldStart { startCamera(settings.selectedCameraID) }
+            guard await waitForFirstFrame() else {
+                isWarmingUp = false
+                if webcam.release(.clip) { camera.stop() }
+                notify(.failure, "Your camera didn’t send a picture. Try recording again.")
+                return
+            }
+            if coldStart { try? await Task.sleep(nanoseconds: Self.warmUpNanoseconds) }
+            isWarmingUp = false
+            await record()
+        }
+    }
+
+    /// Polls rather than racing the first frame: it only runs before a clip.
+    private func waitForFirstFrame() async -> Bool {
+        let deadline = ContinuousClock.now + Self.firstFrameTimeout
+        while !camera.hasDeliveredFrame {
+            guard ContinuousClock.now < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return true
+    }
+
+    private func record() async {
+        let target = max(1, settings.recordDurationSeconds)
+        isRecording = true
+        recordSecondsLeft = Int(target.rounded())
+        recorder.start(maxDuration: target) { [weak self] url, duration in
+            self?.finishRecording(url: url, duration: duration)
+        }
+        // Tick the countdown down to zero, then auto-stop at the chosen length.
+        while isRecording && recordSecondsLeft > 0 {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if isRecording { recordSecondsLeft -= 1 }
+        }
+        if isRecording { recorder.stop() }
+    }
+
+    func stopRecording() {
+        guard isRecording else { return }
+        recorder.stop()
+    }
+
+    private func finishRecording(url: URL?, duration: Double) {
+        isRecording = false
+        recordSecondsLeft = 0
+        // Recording works with the virtual camera off; don't leave the light on.
+        if webcam.release(.clip) {
+            camera.stop()
+            livePreview.clear()   // no stale last frame next time
+            windowLivePreview.clear()
+        }
+        let name = "Clip \(library.clips.count + 1)"
+        guard let url, let clip = library.add(movingFileAt: url, name: name, duration: duration) else {
+            notify(.failure, "Couldn’t save the clip. Try recording again.")
+            return
+        }
+        // A new recording must never hijack the current selection or the running
+        // loop (you can record a clip while looping another). Only auto-select
+        // when nothing is selected yet — the first-ever recording.
+        if selectedClipID == nil { selectClip(clip) }
+    }
+
+    // MARK: - Extension
+
+    func installExtension() {
+        notify(.working, "Setting up the virtual camera…", sticky: true)
+        extensionManager.install()
+    }
+
+    private static let extensionBuildKey = "extensionBuild"
+    private static let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+
+    /// After an update, activate the camera extension bundled with this build,
+    /// so nobody has to click Reinstall. A fresh install is left to setup.
+    private func upgradeExtensionIfNeeded() {
+        guard extensionInstalled,
+              UserDefaults.standard.string(forKey: Self.extensionBuildKey) != Self.appBuild else { return }
+        installExtension()
+    }
+
+    func checkForUpdates() {
+        NSApp.activate(ignoringOtherApps: true)   // a menu-bar app's window would open behind
+        updater.checkForUpdates(nil)
+    }
+
+    func removeExtension() {
+        notify(.working, "Removing the virtual camera…", sticky: true)
+        extensionManager.uninstall()
+    }
+
+    // MARK: - Cameras
+
+    func refreshCameras() {
+        cameras = CameraCaptureManager.availableCameras().map {
+            CameraOption(id: $0.uniqueID, name: $0.localizedName)
+        }
+    }
+
+    /// Sets the picture the virtual camera shows while LiveLoop sends nothing
+    /// (app closed, camera off); nil goes back to the LiveLoop card. Returns
+    /// an error message for Settings to show, or nil on success.
+    func setOffAirPicture(from url: URL?) -> String? {
+        var jpeg = Data()
+        if let url {
+            guard let fitted = pipeline.outputJPEG(fromImageAt: url),
+                  fitted.count <= LiveLoop.OffAirPicture.maxBytes else {
+                return "Couldn’t use that picture. Try a JPEG, PNG or HEIC."
+            }
+            jpeg = fitted
+        }
+        guard SinkStreamPublisher.setOffAirPicture(jpeg) else {
+            return "Couldn’t update the virtual camera. Make sure it’s installed, then try again."
+        }
+        settings.hasOffAirPicture = url != nil
+        return nil
+    }
+
+    private func startCamera(_ deviceID: String?) {
+        isCameraStarting = true
+        camera.start(deviceID: deviceID)
+    }
+
+    func selectCamera(_ id: String?) {
+        settings.selectedCameraID = id
+        if isEngaged { startCamera(id) }
+    }
+
+    // MARK: - Private
+
+    private func requestCameraAccess() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            // A menu-bar-only (accessory) app can't reliably present the TCC
+            // prompt. Become a regular foreground app, let the activation land,
+            // then request so the prompt appears on top.
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            NSApp.setActivationPolicy(.accessory)
+            return granted
+        default:
+            return false
+        }
+    }
+
+    private func applyLagSettings() {
+        loopEngine.lagEnabled = settings.lagEnabled
+        loopEngine.lagIntensity = settings.lagIntensity
+        loopEngine.connectionProfile = beta.connectionProfile
+    }
+
+    private func registerHotkey() {
+        hotkeys.onTrigger = { [weak self] in self?.toggleLoopLive() }
+        if settings.hotkeyEnabled {
+            hotkeys.register(keyCode: settings.hotkeyKeyCode, modifiers: settings.hotkeyModifiers)
+        }
+    }
+
+    private func observeSettings() {
+        // Fires once right away, so the saved quality applies from launch.
+        settings.$outputQuality
+            .sink { [router] quality in router.setOutputQuality(quality) }
+            .store(in: &cancellables)
+        settings.$switchStyle
+            .sink { [router] style in router.setSwitchStyle(style) }
+            .store(in: &cancellables)
+        // The extension can't read our defaults, so it gets the name as a device
+        // property (also sent at launch). Debounced: the field updates per keystroke.
+        settings.$cameraName
+            .map { LiveLoop.cameraName(from: $0) }
+            .removeDuplicates()
+            .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
+            .sink { SinkStreamPublisher.setCameraName($0) }
+            .store(in: &cancellables)
+
+        settings.$lagEnabled
+            .combineLatest(settings.$lagIntensity)
+            .sink { [weak self] _ in self?.applyLagSettings() }
+            .store(in: &cancellables)
+
+        settings.$hotkeyEnabled
+            .combineLatest(settings.$hotkeyKeyCode, settings.$hotkeyModifiers)
+            .sink { [weak self] enabled, keyCode, modifiers in
+                guard let self else { return }
+                self.hotkeys.unregister()
+                if enabled {
+                    self.hotkeys.register(keyCode: keyCode, modifiers: modifiers)
+                }
+            }
+            .store(in: &cancellables)
+    }
+}

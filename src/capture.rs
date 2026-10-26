@@ -66,6 +66,7 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// reenable input capture
     Reenable,
+    Suspend(bool),
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
 }
@@ -75,6 +76,7 @@ impl Capture {
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
+        start_suspended: bool,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -89,6 +91,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            suspended: start_suspended,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -102,6 +105,12 @@ impl Capture {
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(CaptureRequest::Reenable)
+            .expect("channel closed");
+    }
+
+    pub(crate) fn suspend(&self, suspended: bool) {
+        self.request_tx
+            .send(CaptureRequest::Suspend(suspended))
             .expect("channel closed");
     }
 
@@ -173,6 +182,7 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    suspended: bool,
 }
 
 impl CaptureTask {
@@ -208,13 +218,20 @@ impl CaptureTask {
 
     async fn run(mut self) {
         loop {
-            if let Err(e) = self.do_capture().await {
-                log::warn!("input capture exited: {e}");
+            if !self.suspended {
+                if let Err(e) = self.do_capture().await {
+                    log::warn!("input capture exited: {e}");
+                }
             }
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
-                        CaptureRequest::Reenable => break,
+                        CaptureRequest::Reenable if !self.suspended => break,
+                        CaptureRequest::Reenable => {},
+                        CaptureRequest::Suspend(value) => {
+                            self.suspended = value;
+                            if !value { break; }
+                        },
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
@@ -302,6 +319,12 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
+                    CaptureRequest::Suspend(true) => {
+                        self.suspended = true;
+                        self.release_capture(capture).await?;
+                        return Ok(());
+                    },
+                    CaptureRequest::Suspend(false) => {},
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);

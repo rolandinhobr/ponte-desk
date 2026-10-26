@@ -1,0 +1,9 @@
+port = 4242
+release_bind = ["KeyLeftCtrl", "KeyLeftAlt", "KeyEsc"]
+[[clients]]
+hostname = "windows-pc.local"
+ips = ["192.0.2.20"]
+position = "left"
+activate_on_startup = true
+[authorized_fingerprints]
+"REPLACE_WITH_WINDOWS_CERTIFICATE_FINGERPRINT" = "Windows"

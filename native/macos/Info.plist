@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>ponte-desk</string>
+<key>CFBundleIdentifier</key><string>br.com.ponte-desk.app</string>
+<key>CFBundleName</key><string>Ponte Desk</string>
+<key>CFBundleDisplayName</key><string>Ponte Desk</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>0.3.0</string>
+<key>CFBundleIconFile</key><string>PonteDesk.icns</string>
+<key>LSUIElement</key><true/>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSCameraUsageDescription</key><string>Compartilhar somente a webcam USB externa selecionada com o computador pareado, quando você ativar o envio.</string>
+<key>NSInputMonitoringUsageDescription</key><string>Compartilhar teclado e mouse com computadores pareados na rede local.</string>
+</dict></plist>

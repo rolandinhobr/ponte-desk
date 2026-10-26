@@ -1,0 +1,130 @@
+name: LiveLoop
+options:
+  bundleIdPrefix: com.adrbn
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  defaultConfig: Release
+
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.6.0"
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: 2TWQF4T93E
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Apple Development"
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.3.4"
+    CURRENT_PROJECT_VERSION: "22"
+    ENABLE_HARDENED_RUNTIME: YES
+
+targets:
+  # ---------------------------------------------------------------------------
+  # Main menu-bar application (the control plane)
+  # ---------------------------------------------------------------------------
+  LiveLoop:
+    type: application
+    platform: macOS
+    sources:
+      - path: LiveLoop
+    info:
+      path: LiveLoop/Info.plist
+      properties:
+        # Not LSUIElement: a pure background app cannot present the camera TCC
+        # prompt (macOS auto-denies). We hide the Dock icon at runtime after
+        # first-run permission is granted instead (see AppState).
+        LSUIElement: false
+        CFBundleDisplayName: LiveLoop
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSCameraUsageDescription: "LiveLoop records short clips from your webcam and streams them (or your live feed) through its virtual camera."
+        NSMicrophoneUsageDescription: "Your meeting app keeps its own audio; LiveLoop only uses the microphone for the beta Name alert, when you pick Microphone as its source. Speech is transcribed on your Mac and never recorded or sent anywhere."
+        NSSystemExtensionUsageDescription: "LiveLoop installs a virtual camera extension so Zoom, Meet, Teams and other apps can use your looped clip."
+        # Beta features (all opt-in, off by default).
+        NSSpeechRecognitionUsageDescription: "Only for the beta Name alert: LiveLoop listens for your name while you're on the loop. Speech is transcribed on your Mac and never recorded or sent anywhere."
+        NSAudioCaptureUsageDescription: "Only for the beta Name alert: LiveLoop listens to your meeting's audio for your name while you're on the loop. It's transcribed on your Mac and never recorded or sent anywhere."
+        # Sparkle: each GitHub release carries an appcast.xml (see scripts/release.sh).
+        SUFeedURL: https://github.com/adrbn/liveloop/releases/latest/download/appcast.xml
+        SUPublicEDKey: "9cqTwuJ7qDeyTASO7waRHg9Oks0qsKRlDLRi+7ED1t4="
+        SUEnableAutomaticChecks: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.adrbn.LiveLoop.automation
+            CFBundleURLSchemes: [liveloop]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.adrbn.LiveLoop
+        PRODUCT_NAME: LiveLoop
+        CODE_SIGN_ENTITLEMENTS: LiveLoop/LiveLoop.entitlements
+        ENABLE_APP_SANDBOX: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - package: Sparkle
+      - target: LiveLoopExtension
+        embed: true
+        codeSign: true
+
+  # ---------------------------------------------------------------------------
+  # CMIO camera system extension (the virtual camera relay)
+  # ---------------------------------------------------------------------------
+  LiveLoopExtension:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: LiveLoopExtension
+      - path: LiveLoop/Shared/SharedConstants.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.adrbn.LiveLoop.Extension
+        # CRITICAL: a CMIO system extension is only found by OSSystemExtensionManager
+        # when its executable/bundle name equals its bundle identifier.
+        PRODUCT_NAME: com.adrbn.LiveLoop.Extension
+        CODE_SIGN_ENTITLEMENTS: LiveLoopExtension/LiveLoopExtension.entitlements
+        ENABLE_APP_SANDBOX: YES
+        INFOPLIST_FILE: LiveLoopExtension/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+
+  # ---------------------------------------------------------------------------
+  # Unit tests (pure-logic engine + library)
+  # ---------------------------------------------------------------------------
+  LiveLoopTests:
+    type: bundle.unit-test
+    platform: macOS
+    # Compile the pure-logic sources straight into the bundle so tests run
+    # headless — no app host, no @testable, works under plain `xcodebuild test`.
+    sources:
+      - path: Tests/LiveLoopTests
+      - path: LiveLoop/Loop/SplitMix64.swift
+      - path: LiveLoop/Loop/PingPongSequencer.swift
+      - path: LiveLoop/Loop/LagScheduler.swift
+      - path: LiveLoop/Library/Clip.swift
+      - path: LiveLoop/Library/ClipLibrary.swift
+      - path: LiveLoop/Shared/SharedConstants.swift
+      - path: LiveLoop/Shared/ImagePipeline.swift
+      - path: LiveLoop/Camera/OutputQuality.swift
+      - path: LiveLoop/Camera/SwitchTransition.swift
+      - path: LiveLoop/Camera/WebcamClaims.swift
+      - path: LiveLoop/UI/PreviewContent.swift
+      - path: LiveLoop/UI/PreviewWindowLayout.swift
+      # Beta features: only their pure logic is compiled into the tests.
+      - path: LiveLoop/Beta/Core
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.adrbn.LiveLoopTests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+
+schemes:
+  LiveLoop:
+    build:
+      targets:
+        LiveLoop: all
+        LiveLoopExtension: all
+    run:
+      config: Release
+    test:
+      config: Release
+      targets:
+        - LiveLoopTests

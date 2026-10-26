@@ -41,21 +41,24 @@ pub fn local_commit() -> [u8; 8] {
 }
 
 const CONFIG_FILE_NAME: &str = "config.toml";
-const CERT_FILE_NAME: &str = "lan-mouse.pem";
+const CERT_FILE_NAME: &str = "ponte-desk.pem";
 
 fn default_path() -> Result<PathBuf, VarError> {
+    if let Some(path) = env::var_os("PONTE_DESK_HOME") {
+        return Ok(path.into());
+    }
     #[cfg(unix)]
     let default_path = {
         let xdg_config_home =
             env::var("XDG_CONFIG_HOME").unwrap_or(format!("{}/.config", env::var("HOME")?));
-        format!("{xdg_config_home}/lan-mouse/")
+        format!("{xdg_config_home}/ponte-desk/")
     };
 
     #[cfg(not(unix))]
     let default_path = {
         let app_data =
             env::var("LOCALAPPDATA").unwrap_or(format!("{}/.config", env::var("USERPROFILE")?));
-        format!("{app_data}\\lan-mouse\\")
+        format!("{app_data}\\PonteDesk\\")
     };
     Ok(PathBuf::from(default_path))
 }

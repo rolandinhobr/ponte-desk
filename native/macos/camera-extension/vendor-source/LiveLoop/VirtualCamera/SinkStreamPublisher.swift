@@ -1,0 +1,250 @@
+//
+//  SinkStreamPublisher.swift
+//  LiveLoop
+//
+//  Pushes CVPixelBuffers from the app into the camera extension's *sink* stream
+//  using the CoreMediaIO C API. The extension relays whatever lands here to its
+//  source stream, which is what Zoom / Meet / Teams actually display.
+//
+//  Discovery is by the stable device UID (SharedConstants.deviceUID) so a user
+//  renaming the camera never breaks the connection.
+//
+
+import Foundation
+import CoreMediaIO
+import CoreMedia
+import CoreVideo
+import os.log
+
+private let logger = Logger(subsystem: "com.adrbn.LiveLoop", category: "SinkPublisher")
+
+/// Result of attempting to connect to the extension's sink stream.
+enum SinkConnectionState: Equatable {
+    case disconnected
+    case connected
+    case deviceNotFound
+}
+
+final class SinkStreamPublisher {
+
+    private(set) var state: SinkConnectionState = .disconnected
+
+    private var deviceID: CMIODeviceID = 0
+    private var sinkStreamID: CMIOStreamID = 0
+    private var queue: CMSimpleQueue?
+    private var formatDescription: CMFormatDescription?
+    private var frameCount: UInt64 = 0
+
+    /// Attempts to locate the LiveLoop virtual camera and open its sink stream.
+    /// Returns the resulting state; call again after activating the extension.
+    @discardableResult
+    func connect() -> SinkConnectionState {
+        guard let device = Self.findDevice(uid: LiveLoop.deviceUID) else {
+            state = .deviceNotFound
+            return state
+        }
+        deviceID = device
+
+        guard let sink = Self.findSinkStream(device: device) else {
+            state = .deviceNotFound
+            return state
+        }
+        sinkStreamID = sink
+
+        // Grab the queue we enqueue buffers into. The altered-proc is required
+        // but we drive enqueueing ourselves, so it stays a no-op.
+        var queueRef: Unmanaged<CMSimpleQueue>?
+        let status = CMIOStreamCopyBufferQueue(sinkStreamID, { _, _, _ in }, nil, &queueRef)
+        guard status == noErr, let queueRef else {
+            logger.error("CMIOStreamCopyBufferQueue failed: \(status)")
+            state = .disconnected
+            return state
+        }
+        queue = queueRef.takeRetainedValue()
+
+        let startStatus = CMIODeviceStartStream(deviceID, sinkStreamID)
+        guard startStatus == noErr else {
+            logger.error("CMIODeviceStartStream failed: \(startStatus)")
+            state = .disconnected
+            return state
+        }
+
+        state = .connected
+        logger.info("Connected to LiveLoop sink stream.")
+        return state
+    }
+
+    func disconnect() {
+        guard state == .connected else { return }
+        CMIODeviceStopStream(deviceID, sinkStreamID)
+        queue = nil
+        state = .disconnected
+    }
+
+    /// Cheap check for whether the LiveLoop virtual camera is currently
+    /// installed and visible to the system, without opening a stream.
+    static func deviceIsAvailable() -> Bool {
+        findDevice(uid: LiveLoop.deviceUID) != nil
+    }
+
+    /// Sends the off-air picture (JPEG; empty data = the default card) to the
+    /// extension, which keeps it. False if the virtual camera isn't installed
+    /// or refused it.
+    static func setOffAirPicture(_ jpeg: Data) -> Bool {
+        setDeviceString(jpeg.base64EncodedString(), selector: LiveLoop.OffAirPicture.selector)
+    }
+
+    /// Sends the virtual camera's display name; the extension applies it when
+    /// it next starts. False if the virtual camera isn't installed or refused it.
+    @discardableResult
+    static func setCameraName(_ name: String) -> Bool {
+        setDeviceString(name, selector: LiveLoop.CameraName.selector)
+    }
+
+    /// Sets a custom device property. Always a CFString: CMIO silently drops
+    /// data values on custom properties.
+    private static func setDeviceString(_ string: String, selector: UInt32) -> Bool {
+        guard let device = findDevice(uid: LiveLoop.deviceUID) else { return false }
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(selector),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+        var value = string as CFString
+        let status = CMIOObjectSetPropertyData(device, &address, 0, nil,
+                                               UInt32(MemoryLayout<CFString>.size), &value)
+        if status != noErr { logger.error("Setting device property \(selector) failed: \(status)") }
+        return status == noErr
+    }
+
+    /// Calls `handler` whenever the set of CMIO devices changes (the virtual
+    /// camera being installed, replaced, or removed) so the app can keep its
+    /// "installed?" state live instead of caching a stale value at launch.
+    static func observeDeviceChanges(on queue: DispatchQueue = .main,
+                                     _ handler: @escaping () -> Void) {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+        CMIOObjectAddPropertyListenerBlock(
+            CMIOObjectID(kCMIOObjectSystemObject), &address, queue) { _, _ in handler() }
+    }
+
+    /// Enqueues one frame for the extension to broadcast. Silently drops the
+    /// frame if the sink queue is full (the consumer is momentarily behind) so
+    /// we never block the capture pipeline.
+    func send(_ pixelBuffer: CVPixelBuffer) {
+        guard state == .connected, let queue else { return }
+
+        // A full queue means the extension hasn't drained yet — skip this frame.
+        if CMSimpleQueueGetCount(queue) >= CMSimpleQueueGetCapacity(queue) { return }
+
+        if formatDescription == nil ||
+            !CMVideoFormatDescriptionMatchesImageBuffer(formatDescription!, imageBuffer: pixelBuffer) {
+            var desc: CMFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                                         imageBuffer: pixelBuffer,
+                                                         formatDescriptionOut: &desc)
+            formatDescription = desc
+        }
+        guard let formatDescription else { return }
+
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: LiveLoop.frameRate),
+            presentationTimeStamp: now,
+            decodeTimeStamp: .invalid)
+
+        var sampleBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: formatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer)
+
+        guard status == noErr, let sampleBuffer else { return }
+
+        // The queue takes ownership of a retained reference; the extension
+        // releases it after consuming.
+        CMSimpleQueueEnqueue(queue, element: Unmanaged.passRetained(sampleBuffer).toOpaque())
+        frameCount &+= 1
+    }
+
+    // MARK: - Device / stream discovery
+
+    private static func findDevice(uid: String) -> CMIODeviceID? {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+
+        var dataSize: UInt32 = 0
+        guard CMIOObjectGetPropertyDataSize(CMIOObjectID(kCMIOObjectSystemObject),
+                                            &address, 0, nil, &dataSize) == noErr, dataSize > 0 else {
+            return nil
+        }
+        let count = Int(dataSize) / MemoryLayout<CMIOObjectID>.size
+        var devices = [CMIOObjectID](repeating: 0, count: count)
+        var dataUsed: UInt32 = 0
+        guard CMIOObjectGetPropertyData(CMIOObjectID(kCMIOObjectSystemObject),
+                                        &address, 0, nil, dataSize, &dataUsed, &devices) == noErr else {
+            return nil
+        }
+
+        for device in devices {
+            if let deviceUID = stringProperty(object: device, selector: Int(kCMIODevicePropertyDeviceUID)),
+               deviceUID.caseInsensitiveCompare(uid) == .orderedSame {
+                return device
+            }
+        }
+        return nil
+    }
+
+    private static func findSinkStream(device: CMIODeviceID) -> CMIOStreamID? {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIODevicePropertyStreams),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+
+        var dataSize: UInt32 = 0
+        guard CMIOObjectGetPropertyDataSize(device, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else {
+            return nil
+        }
+        let count = Int(dataSize) / MemoryLayout<CMIOStreamID>.size
+        var streams = [CMIOStreamID](repeating: 0, count: count)
+        var dataUsed: UInt32 = 0
+        guard CMIOObjectGetPropertyData(device, &address, 0, nil, dataSize, &dataUsed, &streams) == noErr,
+              !streams.isEmpty else {
+            return nil
+        }
+
+        // The extension adds the source stream first and the sink second, and
+        // CMIO preserves that order — so the sink is the last stream. (The
+        // `kCMIOStreamPropertyDirection` value is not a reliable discriminator
+        // here in practice.)
+        return streams.last
+    }
+
+
+    private static func stringProperty(object: CMIOObjectID, selector: Int) -> String? {
+        var address = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(selector),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+
+        var dataSize: UInt32 = 0
+        guard CMIOObjectGetPropertyDataSize(object, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else {
+            return nil
+        }
+        var cfString: CFString?
+        var dataUsed: UInt32 = 0
+        let status = withUnsafeMutablePointer(to: &cfString) { ptr -> OSStatus in
+            CMIOObjectGetPropertyData(object, &address, 0, nil, dataSize, &dataUsed, ptr)
+        }
+        guard status == noErr else { return nil }
+        return cfString as String?
+    }
+}

@@ -1,0 +1,27 @@
+# Build products
+build/
+dist/
+DerivedData/
+*.dmg
+
+# XcodeGen output (regenerate with `xcodegen generate`)
+*.xcodeproj
+
+# macOS / Xcode cruft
+.DS_Store
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+
+# Swift Package Manager
+.build/
+.swiftpm/
+build_auto/
+
+# Python bytecode (scripts/make_icon.py)
+__pycache__/
+
+# Local-only experiments (never pushed)
+beta-features/

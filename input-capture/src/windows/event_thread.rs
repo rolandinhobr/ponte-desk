@@ -4,7 +4,7 @@ use std::ptr::addr_of_mut;
 
 use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -18,12 +18,13 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW,
+    EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
 use input_event::{
@@ -32,25 +33,40 @@ use input_event::{
 };
 
 use super::{CaptureEvent, Position, display_util};
+use crate::CaptureCreationError;
 
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     thread: Option<thread::JoinHandle<()>>,
     thread_id: u32,
+    stopping: Arc<AtomicBool>,
+    release_pending: Arc<AtomicBool>,
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(
+        event_tx: Sender<(Position, CaptureEvent)>,
+    ) -> Result<Self, CaptureCreationError> {
         let request_buffer = Default::default();
-        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
-        Self {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let release_pending = Arc::new(AtomicBool::new(false));
+        let (thread, thread_id) = start(
+            event_tx,
+            Arc::clone(&request_buffer),
+            Arc::clone(&stopping),
+            Arc::clone(&release_pending),
+        )?;
+        Ok(Self {
             request_buffer,
             thread: Some(thread),
             thread_id,
-        }
+            stopping,
+            release_pending,
+        })
     }
 
     pub(crate) fn release_capture(&self) {
+        self.release_pending.store(true, Ordering::Release);
         self.signal(RequestType::Release);
     }
 
@@ -63,12 +79,16 @@ impl EventThread {
     }
 
     fn exit(&self) {
+        self.stopping.store(true, Ordering::Release);
         self.signal(RequestType::Exit);
     }
 
     fn client_update(&self, request: ClientUpdate) {
         {
-            let mut requests = self.request_buffer.lock().unwrap();
+            let mut requests = self
+                .request_buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             requests.push(request);
         }
         self.signal(RequestType::ClientUpdate);
@@ -76,14 +96,26 @@ impl EventThread {
 
     fn signal(&self, event_type: RequestType) {
         let id = self.thread_id;
-        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)).unwrap() };
+        if id != 0 {
+            // A dead thread or a full queue must never panic during teardown.
+            // Sticky stop/release flags are checked before every queued message.
+            if let Err(e) =
+                unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)) }
+            {
+                log::debug!("capture thread notification failed: {e}");
+            }
+        }
     }
 }
 
 impl Drop for EventThread {
     fn drop(&mut self) {
         self.exit();
-        let _ = self.thread.take().expect("thread").join();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                log::error!("Windows capture thread exited unexpectedly");
+            }
+        }
     }
 }
 
@@ -98,15 +130,27 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
-
 fn try_send_event(
     pos: Position,
     event: CaptureEvent,
 ) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+    EVENT_TX.with_borrow(|tx| match tx {
+        Some(tx) => {
+            // Bound motion backlog while retaining room for Begin, key-up and
+            // button transitions. Never block a native hook callback.
+            if tx.capacity() <= 16
+                && matches!(
+                    event,
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { .. }))
+                )
+            {
+                Err(TrySendError::Full((pos, event)))
+            } else {
+                tx.try_send((pos, event))
+            }
+        }
+        None => Err(TrySendError::Closed((pos, event))),
+    })
 }
 
 thread_local! {
@@ -131,124 +175,184 @@ fn get_msg() -> Option<MSG> {
         match ret.0 {
             0 => None,
             x if x > 0 => Some(msg),
-            _ => panic!("error in GetMessageW"),
+            _ => {
+                log::error!(
+                    "Windows capture GetMessageW failed: {}",
+                    windows::core::Error::from_win32()
+                );
+                None
+            }
         }
     }
+}
+
+/// All Win32 resources are owned by the message thread and released there,
+/// including partial initialization and a closed/full event consumer.
+#[derive(Default)]
+struct ThreadResources {
+    mouse: Option<HHOOK>,
+    keyboard: Option<HHOOK>,
+    window: Option<HWND>,
+}
+impl Drop for ThreadResources {
+    fn drop(&mut self) {
+        ACTIVE_CLIENT.set(None);
+        PREV_POS.set(None);
+        CLIENTS.with_borrow_mut(HashSet::clear);
+        unsafe {
+            if let Some(hook) = self.mouse.take() {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+            if let Some(hook) = self.keyboard.take() {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+            if let Some(window) = self.window.take() {
+                let _ = DestroyWindow(window);
+            }
+        }
+        EVENT_TX.take();
+    }
+}
+
+fn initialize() -> Result<ThreadResources, String> {
+    // PeekMessage creates the queue even when there are no pending messages.
+    unsafe {
+        let _ = PeekMessageW(&mut MSG::default(), None, 0, 0, PM_NOREMOVE);
+    }
+    let instance = unsafe { GetModuleHandleW(None) }
+        .map_err(|e| e.to_string())?
+        .into();
+    static WINDOW_CLASS: OnceLock<Result<(), String>> = OnceLock::new();
+    WINDOW_CLASS
+        .get_or_init(|| {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                lpszClassName: w!("lan-mouse-message-window-class"),
+                ..Default::default()
+            };
+            if unsafe { RegisterClassW(&class) } == 0 {
+                let error = windows::core::Error::from_win32();
+                // The process-wide class remains valid between capture lifetimes.
+                if error.code().0 as u32 != 0x80070582 {
+                    return Err(error.to_string());
+                }
+            }
+            Ok(())
+        })
+        .clone()?;
+    let mut resources = ThreadResources {
+        mouse: None,
+        keyboard: None,
+        window: Some(
+            unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    w!("lan-mouse-message-window-class"),
+                    w!("lan-mouse-msg-window"),
+                    WINDOW_STYLE::default(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    Some(instance),
+                    None,
+                )
+            }
+            .map_err(|e| e.to_string())?,
+        ),
+    };
+    resources.mouse = Some(
+        unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) }
+            .map_err(|e| e.to_string())?,
+    );
+    resources.keyboard = Some(
+        unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(kybrd_proc), None, 0) }
+            .map_err(|e| e.to_string())?,
+    );
+    Ok(resources)
 }
 
 fn start(
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
-) -> (thread::JoinHandle<()>, u32) {
-    /* condition variable to wait for thead id */
-    let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
-    let thread_id_ = Arc::clone(&thread_id);
-
-    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer));
-
-    /* wait for thread to set its id */
-    let (cond, thread_id) = &*thread_id;
-    let mut thread_id = thread_id.lock().unwrap();
-    while (*thread_id).is_none() {
-        thread_id = cond.wait(thread_id).expect("channel closed");
+    stopping: Arc<AtomicBool>,
+    release_pending: Arc<AtomicBool>,
+) -> Result<(thread::JoinHandle<()>, u32), CaptureCreationError> {
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let msg_thread = thread::Builder::new()
+        .name("windows-input-capture".into())
+        .spawn(move || {
+            start_routine(
+                ready_tx,
+                event_tx,
+                request_buffer,
+                stopping,
+                release_pending,
+            )
+        })
+        .map_err(|error| {
+            log::error!("Windows capture thread creation failed: {error}");
+            CaptureCreationError::Windows
+        })?;
+    // EOF also wakes the caller if initialization fails; it cannot wait forever.
+    match ready_rx.recv() {
+        Ok(id) => Ok((msg_thread, id)),
+        Err(_) => {
+            let _ = msg_thread.join();
+            Err(CaptureCreationError::Windows)
+        }
     }
-    (msg_thread, thread_id.expect("thread id"))
 }
 
 fn start_routine(
-    ready: Arc<(Condvar, Mutex<Option<u32>>)>,
+    ready: mpsc::SyncSender<u32>,
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    stopping: Arc<AtomicBool>,
+    release_pending: Arc<AtomicBool>,
 ) {
     EVENT_TX.replace(Some(event_tx));
-    /* communicate thread id */
-    {
-        let (cnd, mtx) = &*ready;
-        let mut ready = mtx.lock().unwrap();
-        *ready = Some(unsafe { GetCurrentThreadId() });
-        cnd.notify_one();
-    }
-
-    let mouse_proc: HOOKPROC = Some(mouse_proc);
-    let kybrd_proc: HOOKPROC = Some(kybrd_proc);
-    let window_proc: WNDPROC = Some(window_proc);
-
-    /* register hooks */
-    unsafe {
-        let _ = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, None, 0).unwrap();
-        let _ = SetWindowsHookExW(WH_KEYBOARD_LL, kybrd_proc, None, 0).unwrap();
-    }
-
-    let instance = unsafe { GetModuleHandleW(None).unwrap() };
-    let instance = instance.into();
-    let window_class: WNDCLASSW = WNDCLASSW {
-        lpfnWndProc: window_proc,
-        hInstance: instance,
-        lpszClassName: w!("lan-mouse-message-window-class"),
-        ..Default::default()
-    };
-
-    static WINDOW_CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
-    if WINDOW_CLASS_REGISTERED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        /* register window class if not yet done so */
-        unsafe {
-            let ret = RegisterClassW(&window_class);
-            if ret == 0 {
-                panic!("RegisterClassW");
-            }
+    let _resources = match initialize() {
+        Ok(resources) => resources,
+        Err(error) => {
+            EVENT_TX.take();
+            log::error!("Windows capture initialization failed: {error}");
+            return;
         }
+    };
+    // READY means queue, window and both hooks are completely initialized.
+    if ready.send(unsafe { GetCurrentThreadId() }).is_err() {
+        return;
     }
-
-    /* window is used ro receive WM_DISPLAYCHANGE messages */
-    unsafe {
-        CreateWindowExW(
-            Default::default(),
-            w!("lan-mouse-message-window-class"),
-            w!("lan-mouse-msg-window"),
-            WINDOW_STYLE::default(),
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            Some(instance),
-            None,
-        )
-        .expect("CreateWindowExW");
-    }
-
-    /* run message loop */
-    while let Some(msg) = get_msg() {
-        // mouse / keybrd proc do not actually return a message
-        if msg.hwnd.0.is_null() {
-            /* messages sent via PostThreadMessage */
+    while !stopping.load(Ordering::Acquire) {
+        let Some(msg) = get_msg() else {
+            break;
+        };
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        if release_pending.swap(false, Ordering::AcqRel) {
+            ACTIVE_CLIENT.set(None);
+            PREV_POS.set(None);
+        }
+        if msg.hwnd.0.is_null() && msg.message == WM_USER {
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
-                x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
-                }
+                x if x == RequestType::Release as usize => {}
                 x if x == RequestType::ClientUpdate as usize => {
-                    let requests = {
-                        let mut res = vec![];
-                        let mut requests = request_buffer.lock().unwrap();
-                        for request in requests.drain(..) {
-                            res.push(request);
-                        }
-                        res
-                    };
-
+                    let requests = std::mem::take(
+                        &mut *request_buffer.lock().unwrap_or_else(|e| e.into_inner()),
+                    );
                     for request in requests {
-                        update_clients(request)
+                        update_clients(request);
                     }
                 }
                 _ => {}
             }
         } else {
-            /* other messages for window_procs */
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -298,13 +402,31 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    // A hook callback must never block waiting for the async consumer. A full
+    // or closed channel leaves this physical event and subsequent input local.
+    if try_send_event(pos, CaptureEvent::Begin).is_err() {
+        ACTIVE_CLIENT.set(None);
+        PREV_POS.set(None);
+        return false;
+    }
 
     ret
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+    let event = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+    if crate::input_origin::windows_mouse_is_software(event.flags)
+        && event.dwExtraInfo != crate::input_origin::EMULATION_TAG
+    {
+        crate::input_origin::record_software_event();
+        // Do not alter PREV_POS: an agent's warp must not create a physical
+        // barrier crossing on the user's next event.
+        PREV_POS.set(None);
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -324,7 +446,11 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     /* notify mainthread (drop events if sending too fast) */
     if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
+        if matches!(e, TrySendError::Closed(_)) {
+            ACTIVE_CLIENT.set(None);
+            PREV_POS.set(None);
+            return CallNextHookEx(None, ncode, wparam, lparam);
+        }
     }
 
     /* don't pass event to applications */
@@ -332,6 +458,16 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+    let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+    if crate::input_origin::windows_key_is_software(event.flags.0)
+        && event.dwExtraInfo != crate::input_origin::EMULATION_TAG
+    {
+        crate::input_origin::record_software_event();
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         return CallNextHookEx(None, ncode, wparam, lparam);
@@ -343,7 +479,11 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     };
 
     if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
+        // Missing a keyboard transition must not trap further local input.
+        ACTIVE_CLIENT.set(None);
+        PREV_POS.set(None);
+        log::debug!("capture keyboard consumer unavailable: {e}");
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */
@@ -545,5 +685,66 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn motion_backlog_reserves_capacity_for_critical_transitions() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        EVENT_TX.replace(Some(tx));
+        let motion = CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        }));
+        for _ in 0..112 {
+            assert!(try_send_event(Position::Left, motion).is_ok());
+        }
+        assert!(matches!(
+            try_send_event(Position::Left, motion),
+            Err(TrySendError::Full(_))
+        ));
+        for i in 0..16 {
+            let critical = match i % 3 {
+                0 => CaptureEvent::Begin,
+                1 => CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: 30,
+                    state: 0,
+                })),
+                _ => CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                    time: 0,
+                    button: BTN_LEFT,
+                    state: 0,
+                })),
+            };
+            assert!(try_send_event(Position::Left, critical).is_ok());
+        }
+        EVENT_TX.take();
+    }
+
+    #[test]
+    fn a_full_or_closed_consumer_never_blocks_the_hook_sender() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        EVENT_TX.replace(Some(tx));
+        assert!(try_send_event(Position::Left, CaptureEvent::Begin).is_ok());
+        assert!(matches!(
+            try_send_event(Position::Left, CaptureEvent::Begin),
+            Err(TrySendError::Full(_))
+        ));
+        drop(rx);
+        assert!(matches!(
+            try_send_event(Position::Left, CaptureEvent::Begin),
+            Err(TrySendError::Closed(_))
+        ));
+        EVENT_TX.take();
+        assert!(matches!(
+            try_send_event(Position::Left, CaptureEvent::Begin),
+            Err(TrySendError::Closed(_))
+        ));
     }
 }
