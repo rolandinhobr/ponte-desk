@@ -43,6 +43,7 @@ internal sealed class Desk:ApplicationContext {
     private readonly Form panel=new PanelWindow();private readonly FlowLayoutPanel content=new FlowLayoutPanel();
     private readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();
     private readonly RegisteredWaitHandle activation;
+    private ComboBox inputMode;private bool syncingInputMode;
     private Label heading,status,inputStatus,cameraStatus,storageStatus,monitorStatus;
     private Button input,cameraStart,cameraStop,sdStart,sdStop,sdOpen,sdRefresh;
     private ComboBox cameraOrigin,cameras,quality,cardOrigin,cards;
@@ -75,7 +76,9 @@ internal sealed class Desk:ApplicationContext {
         content.Dock=DockStyle.Fill;content.FlowDirection=FlowDirection.TopDown;content.WrapContents=false;content.AutoScroll=true;content.Padding=new Padding(24,0,16,16);content.BackColor=Artwork.Background;
         panel.Controls.Add(content);panel.Controls.Add(header);
         input=Button("Pausar teclado e mouse",async()=>{await runtime.Bridge(runtime.Paused);RefreshState();});inputStatus=Label("");
-        Section("Teclado e mouse",inputStatus,input,Label("Controle local: Ctrl + Alt + Esc"));
+        inputMode=Combo("Destino do teclado e mouse");inputMode.Items.AddRange(new[]{"Passar pelas bordas","Usar os periféricos dos dois no Mac","Usar os periféricos dos dois neste Windows"});inputMode.SelectedIndex=0;
+        inputMode.SelectedIndexChanged+=async(s,e)=>{if(syncingInputMode||busy)return;await Run(async()=>{await Patch(new Dictionary<string,object>{{"input_mode",new[]{"edges","to_mac","to_pc"}[inputMode.SelectedIndex]}});await runtime.Bridge(true);});};
+        Section("Teclado e mouse",inputStatus,inputMode,input,Label("Controle local: Ctrl + Alt + Esc"));
         cameraOrigin=Combo("Computador ao qual a webcam está conectada");cameraOrigin.Items.AddRange(new[]{"Conectada a este PC","Conectada ao Mac"});cameraOrigin.SelectedIndex=0;
         cameras=Combo("Webcam USB externa");quality=Combo("Qualidade da webcam");quality.Items.AddRange(new[]{"1080p · 30 fps","720p · 30 fps"});quality.SelectedIndex=0;quality.Width=190;
         cameraOrigin.SelectedIndexChanged+=async(s,e)=>await Run(RefreshCameras);
@@ -99,15 +102,16 @@ internal sealed class Desk:ApplicationContext {
     private Dictionary<string,object> Options(){return runtime.Read(File.Exists(Path.Combine(runtime.Root,"peer-preferences.json"))?"peer-preferences.json":"preferences.json");}
     private void RefreshState(){
         var engine=runtime.Read("engine-status.json");var options=Options();bool fresh=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()-Json.Number(engine,"timestamp_ms")<6500;
+        if(!busy){syncingInputMode=true;inputMode.SelectedIndex=Array.IndexOf(new[]{"edges","to_mac","to_pc"},Json.Text(options,"input_mode","edges"));if(inputMode.SelectedIndex<0)inputMode.SelectedIndex=0;syncingInputMode=false;}
         input.Text=runtime.Paused?"Retomar teclado e mouse":"Pausar teclado e mouse";
         inputStatus.Text=runtime.Preview?"Prévia da interface · nenhuma operação real":!fresh?"Motor indisponível. Use Reconectar.":Json.Text(engine,"reason","Aguardando conexão");
         if(!busy)status.Text=feedback??(runtime.Preview?"Prévia da interface":runtime.Paused?"Teclado e mouse em pausa":Json.Flag(engine,"capture_installed")&&fresh?"Pronto para compartilhar":"Controle local protegido");
         if(iconPaused!=runtime.Paused){iconPaused=runtime.Paused;var next=Artwork.Icon(runtime.Paused);tray.Icon=next;if(icon!=null)icon.Dispose();icon=next;panel.Icon=icon;}
         var camera=runtime.Read("webcam-status.json");cameraStatus.Text=Json.Text(camera,"message","Webcam desligada");
-        monitorSection.Visible=Json.Flag(options,"shared_monitor");autoDisplays.Checked=Json.Flag(options,"manage_displays");monitorStatus.Text=Json.Text(engine,"reason");
+        monitorSection.Visible=Json.Flag(options,"shared_monitor")&&Json.Text(options,"input_mode","edges")=="edges";autoDisplays.Checked=Json.Flag(options,"manage_displays");monitorStatus.Text=Json.Text(engine,"reason");
         storageStatus.Text=storage.Message;sdStart.Text=storage.Active?"Montar no destino":"Compartilhar cartão";ControlsState();
     }
-    private void ControlsState(){bool free=!busy&&!runtime.Preview;input.Enabled=free;cameraOrigin.Enabled=free;cameras.Enabled=free;cameraStart.Enabled=free&&(Json.Get(Options(),"webcam_enabled")==null||Json.Flag(Options(),"webcam_enabled"));cameraStop.Enabled=free;cardOrigin.Enabled=free&&!storage.Active;cards.Enabled=free&&!storage.Active;sdStart.Enabled=free&&!storage.Pending&&(storage.Active||cards.SelectedItem is Choice);sdStop.Enabled=free&&storage.Active&&!storage.Pending;sdOpen.Enabled=free&&storage.Mounted;sdRefresh.Enabled=free&&!storage.Pending;}
+    private void ControlsState(){bool free=!busy&&!runtime.Preview;input.Enabled=free;inputMode.Enabled=free;cameraOrigin.Enabled=free;cameras.Enabled=free;cameraStart.Enabled=free&&(Json.Get(Options(),"webcam_enabled")==null||Json.Flag(Options(),"webcam_enabled"));cameraStop.Enabled=free;cardOrigin.Enabled=free&&!storage.Active;cards.Enabled=free&&!storage.Active;sdStart.Enabled=free&&!storage.Pending&&(storage.Active||cards.SelectedItem is Choice);sdStop.Enabled=free&&storage.Active&&!storage.Pending;sdOpen.Enabled=free&&storage.Mounted;sdRefresh.Enabled=free&&!storage.Pending;}
     private async void Tick(){if(exiting)return;RefreshState();ticks++;if(!runtime.Preview&&!busy&&!polling&&(panel.Visible||storage.Active)&&ticks%3==0){polling=true;try{await storage.Refresh();}catch(Exception e){storage.Message=e.Message;}finally{polling=false;if(!exiting)RefreshState();}}}
     private async Task RefreshCameras(){var result=cameraOrigin.SelectedIndex==0?await runtime.Command("webcam","list"):await runtime.Command("webcam","devices","--peer",await runtime.Peer());cameras.Items.Clear();foreach(var d in Json.Items(result,"devices")){string id=Json.Text(d,"id");if(id.Length>0)cameras.Items.Add(new Choice(id,Json.Text(d,"name","Webcam externa")));}if(cameras.Items.Count>0)cameras.SelectedIndex=0;}
     private async Task StartCamera(){if(Json.Get(Options(),"webcam_enabled") is bool&&!Json.Flag(Options(),"webcam_enabled"))throw new InvalidOperationException("Ative a webcam nos Ajustes.");var device=cameras.SelectedItem as Choice;if(device==null)throw new InvalidOperationException("Selecione uma webcam USB externa.");string peer=await runtime.Peer(),q=quality.SelectedIndex==1?"720p":"1080p";await runtime.StopCamera();await Task.Delay(1200);

@@ -7,6 +7,7 @@ use std::{fs, io, path::Path};
 pub struct Preferences {
     pub local_name: String,
     pub peer_name: String,
+    pub input_mode: String,
     pub shared_monitor: bool,
     pub manage_displays: bool,
     pub protect_windows_fullscreen: bool,
@@ -22,6 +23,7 @@ impl Default for Preferences {
         Self {
             local_name: "Mac".into(),
             peer_name: "Windows".into(),
+            input_mode: "edges".into(),
             shared_monitor: false,
             manage_displays: false,
             protect_windows_fullscreen: true,
@@ -36,6 +38,9 @@ impl Default for Preferences {
 }
 impl Preferences {
     pub fn validate(&self) -> io::Result<()> {
+        if !["edges", "to_mac", "to_pc"].contains(&self.input_mode.as_str()) {
+            return Err(io::Error::other("invalid keyboard and mouse mode"));
+        }
         for (text, maximum) in [
             (&self.local_name, 64),
             (&self.peer_name, 64),
@@ -50,6 +55,7 @@ impl Preferences {
             return Err(io::Error::other("invalid monitor input"));
         }
         if self.shared_monitor
+            && self.input_mode == "edges"
             && (self.windows_monitor.is_empty()
                 || self.mac_monitor_uuid.is_empty()
                 || self.mac_input == 0

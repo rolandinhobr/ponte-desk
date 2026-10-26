@@ -27,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     let displays = DisplayController()
     var preview:Bool {ProcessInfo.processInfo.environment["PONTE_DESK_PREVIEW"] == "1"}
     var options:[String:Any] {
-        var values:[String:Any] = ["local_name":"Mac","peer_name":"Windows","shared_monitor":false,"manage_displays":false,"protect_windows_fullscreen":true,"protect_mac_fullscreen":true,"webcam_enabled":true,"windows_monitor":"","mac_monitor_uuid":"","mac_input":0,"pc_input":0]
+        var values:[String:Any] = ["local_name":"Mac","peer_name":"Windows","input_mode":"edges","shared_monitor":false,"manage_displays":false,"protect_windows_fullscreen":true,"protect_mac_fullscreen":true,"webcam_enabled":true,"windows_monitor":"","mac_monitor_uuid":"","mac_input":0,"pc_input":0]
         for (key,value) in readJSON("preferences.json"){values[key]=value};return values
     }
     var localDisplayName:String {options["local_name"] as? String ?? "Mac"}
@@ -39,6 +39,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var permissionsButton:NSButton?;var cameraComponentButton:NSButton?;var inputSwitch:NSSwitch?;var inputState:NSTextField?;var cameraOrigin:NSSegmentedControl?
     var cameraStart:NSButton?;var cameraStop:NSButton?;var cameraNameHint:NSTextField?
     var monitorGroup:NSView?;var monitorStatus:NSTextField?;var autoDisplaySwitch:NSSwitch?;var layoutLabel:NSTextField?
+    var inputMode:NSPopUpButton?
+    var changingInputMode=false
     var settingsController:PonteSettingsController?
     var preparingCamera=false
     lazy var storage = PonteStorageController(owner:self)
@@ -218,15 +220,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     func refreshPanel(){
         statusText?.stringValue=mode();item?.button?.image=PonteArtwork.menuIcon(paused:paused)
         inputSwitch?.state=paused ? .off:.on
+        let fixed=(options["input_mode"] as? String ?? "edges") != "edges"
+        if !changingInputMode{inputMode?.selectItem(at:["edges","to_mac","to_pc"].firstIndex(of:options["input_mode"] as? String ?? "edges") ?? 0)}
         let state=readJSON("observer-status.json"),policy=state["policy"] as? [Any]
         inputState?.stringValue=preview ? "Disponível nos dois sentidos" : policy?.last as? String ?? "Configure o par para começar"
         let permission=preview || (AXIsProcessTrusted() && CGPreflightListenEventAccess())
         detailText?.stringValue=permission ? "":"Autorize controle e monitoração de entrada nas permissões deste Mac."
         detailText?.isHidden=permission;permissionsButton?.isHidden=permission
         let directions=["left":"à esquerda","right":"à direita","top":"acima","bottom":"abaixo"]
-        layoutLabel?.stringValue="\(peerDisplayName) \(directions[peerPosition] ?? "ao lado")";layoutLabel?.isHidden=false
+        layoutLabel?.stringValue="\(peerDisplayName) \(directions[peerPosition] ?? "ao lado")";layoutLabel?.isHidden=fixed
         let shared=options["shared_monitor"] as? Bool == true
-        monitorGroup?.isHidden = !shared;autoDisplaySwitch?.state=options["manage_displays"] as? Bool == true ? .on:.off
+        monitorGroup?.isHidden = !shared || fixed;autoDisplaySwitch?.state=options["manage_displays"] as? Bool == true ? .on:.off
         monitorStatus?.stringValue=policy?.last as? String ?? "Aguardando monitor"
         let cameraEnabled=options["webcam_enabled"] as? Bool != false
         cameraStart?.isEnabled=cameraEnabled && !preview
@@ -235,6 +239,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if !cameraEnabled{cameraState?.stringValue="Webcam desativada nos ajustes"}
     }
 
+    @objc func changeInputMode(){
+        guard !preview,!changingInputMode,let peer=cameraPeer,let index=inputMode?.indexOfSelectedItem,index>=0,index<3 else{return}
+        changingInputMode=true;inputMode?.isEnabled=false
+        let selected=["edges","to_mac","to_pc"][index]
+        let patch=String(decoding:try! JSONSerialization.data(withJSONObject:["input_mode":selected]),as:UTF8.self)
+        command(["settings","update","--patch",patch]){[weak self] result in
+            guard let self else{return}
+            if let error=result["error"] as? String{self.changingInputMode=false;self.inputMode?.isEnabled=true;self.detailText?.stringValue=error;self.detailText?.isHidden=false;return}
+            self.command(["settings","bridge","--enabled","true","--peer",peer]){result in
+                self.changingInputMode=false;self.inputMode?.isEnabled=true;self.refreshPanel()
+                if let error=result["error"] as? String{self.detailText?.stringValue=error;self.detailText?.isHidden=false}
+            }
+        }
+    }
     @objc func togglePause() {
         guard let peer=cameraPeer else{return}
         command(["settings","bridge","--enabled",paused ? "true":"false","--peer",peer]){[weak self] result in

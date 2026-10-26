@@ -29,6 +29,10 @@ pub struct State {
     pub emulation: bool,
     pub ack: u64,
     #[serde(default)]
+    pub direct_supported: bool,
+    #[serde(default)]
+    pub direct_active: bool,
+    #[serde(default)]
     pub preferences: Option<crate::preferences::Preferences>,
 }
 #[derive(Clone, Deserialize)]
@@ -102,7 +106,7 @@ impl Auth {
     fn encode(&mut self, state: State) -> Vec<u8> {
         self.seq += 1;
         let body = Body {
-            v: 3,
+            v: 4,
             side: self.side.clone(),
             session: self.session.clone(),
             seq: self.seq,
@@ -124,7 +128,7 @@ impl Auth {
         let envelope: Envelope = serde_json::from_slice(data).ok()?;
         let body = envelope.body;
         let other = if self.side == "mac" { "pc" } else { "mac" };
-        if body.v != 3
+        if body.v != 4
             || body.side != other
             || body.session.len() != 32
             || body.time_ms.abs_diff(now_ms()) > 30_000
@@ -204,9 +208,6 @@ pub fn choose_policy(
     let Some(peer) = peer.filter(|_| age < Duration::from_secs(6)) else {
         return Policy::local("rede local: aguardando a outra máquina");
     };
-    if local.agent || peer.agent {
-        return Policy::local("agente usando o controle: máquinas isoladas");
-    }
     if local.manual_pause || peer.manual_pause {
         return Policy::local("compartilhamento pausado no painel");
     }
@@ -216,6 +217,36 @@ pub fn choose_policy(
         (peer, local)
     };
     let options = mac.preferences.clone().unwrap_or_default();
+    let fixed = options.input_mode != "edges";
+    let target = if options.input_mode == "to_mac" {
+        "mac"
+    } else {
+        "pc"
+    };
+    let source_agent = if target == "mac" { pc.agent } else { mac.agent };
+    if (local.agent || peer.agent) && (!fixed || source_agent) {
+        return Policy::local("agente usando o controle: máquinas isoladas");
+    }
+    if fixed && (!local.direct_supported || !peer.direct_supported) {
+        return Policy::local("Atualize os dois computadores para usar periféricos fixos");
+    }
+    if fixed {
+        let receiving = side == target;
+        return Policy {
+            capture: !receiving && peer.emulation && !peer.capture && !local.emulation,
+            emulation: receiving,
+            direct: !receiving,
+            reason: if receiving {
+                "Periféricos do outro computador conectados aqui"
+            } else if peer.emulation {
+                "Teclado e mouse fixos no outro computador"
+            } else {
+                "Aguardando o destino liberar os periféricos"
+            }
+            .into(),
+            expires_ms: now_ms() + 8_000,
+        };
+    }
     if options.protect_windows_fullscreen && pc.platform.fullscreen {
         return Policy::local("Windows em tela cheia: controle local protegido");
     }
@@ -223,6 +254,7 @@ pub fn choose_policy(
         let capture = !(side == "mac" && options.protect_mac_fullscreen && mac.platform.fullscreen);
         return Policy {
             capture,
+            direct: false,
             emulation: true,
             reason: if capture {
                 "Teclado e mouse disponíveis"
@@ -254,6 +286,7 @@ pub fn choose_policy(
     };
     Policy {
         capture,
+        direct: false,
         emulation,
         reason: reason.into(),
         expires_ms: now_ms() + 8_000,
@@ -293,6 +326,7 @@ impl Coordinator {
             root,
             local: State {
                 preferences: Some(options),
+                direct_supported: true,
                 ..Default::default()
             },
             config,
@@ -387,26 +421,39 @@ impl Coordinator {
             };
             let status = serde_json::json!({"timestamp":now_ms() as f64/1000.,"pid":std::process::id(),"side":self.config.side,"peer_paused":self.peer.as_ref().is_some_and(|p|p.manual_pause),"peer_address":self.learned.map(|a|a.ip().to_string()),
                 "local":self.local,"peer_age":if peer.is_some(){Some(self.peer_seen.elapsed().as_secs_f64())}else{None},
-                "peer_engine":peer.map(|p|serde_json::json!({"capture_installed":p.capture,"emulation_enabled":p.emulation,"ack":p.ack})),
+                "peer_engine":peer.map(|p|serde_json::json!({"capture_installed":p.capture,"emulation_enabled":p.emulation,"direct_active":p.direct_active,"ack":p.ack})),
+                "input":{"mode":self.local.preferences.as_ref().map(|p|p.input_mode.as_str()),"target_local":self.local.preferences.as_ref().is_some_and(|p|(p.input_mode=="to_mac"&&self.config.side=="mac")||(p.input_mode=="to_pc"&&self.config.side=="pc"))},
                 "policy":[self.applied.capture,self.applied.emulation,self.applied.reason],
-                "display":{"automatic":self.local.preferences.as_ref().is_some_and(|p|p.manage_displays && p.shared_monitor),"input":pc.and_then(|p|p.platform.input),"input_age_ms":pc.and_then(|p|p.platform.input_age_ms),"peer_fresh":self.peer_seen.elapsed()<Duration::from_secs(6),"mac_input":self.local.preferences.as_ref().map_or(0,|p|p.mac_input),"pc_input":self.local.preferences.as_ref().map_or(0,|p|p.pc_input)}});
+                "display":{"automatic":self.local.preferences.as_ref().is_some_and(|p|p.manage_displays && p.shared_monitor && p.input_mode == "edges"),"input":pc.and_then(|p|p.platform.input),"input_age_ms":pc.and_then(|p|p.platform.input_age_ms),"peer_fresh":self.peer_seen.elapsed()<Duration::from_secs(6),"mac_input":self.local.preferences.as_ref().map_or(0,|p|p.mac_input),"pc_input":self.local.preferences.as_ref().map_or(0,|p|p.pc_input)}});
             let _ = atomic_json(&self.root.join("observer-status.json"), &status);
             self.last_status = Instant::now();
         }
         self.applied.clone()
     }
-    pub fn actual(&mut self, capture: bool, emulation: bool) {
+    pub fn actual(&mut self, capture: bool, emulation: bool, direct_active: bool) {
         if self.local.capture != capture || self.local.emulation != emulation {
             self.last_send = Instant::now() - Duration::from_secs(1);
         }
+        self.local.direct_active = direct_active;
         self.local.capture = capture;
         self.local.emulation = emulation;
         // Remote ACK echoes a monotonically increasing peer sequence only after
         // actual native hooks have been removed (not merely a desired policy).
         self.local.ack = if (self.local.agent || self.peer.as_ref().is_some_and(|p| p.agent))
-            && !capture
-            && !emulation
-        {
+            && ((!capture && !emulation)
+                || self.local.preferences.as_ref().is_some_and(|p| {
+                    let target = if p.input_mode == "to_mac" {
+                        "mac"
+                    } else {
+                        "pc"
+                    };
+                    p.input_mode != "edges"
+                        && if self.config.side == target {
+                            !capture && emulation
+                        } else {
+                            capture && !emulation && direct_active && !self.local.agent
+                        }
+                })) {
             now_ms()
         } else {
             0
@@ -444,6 +491,71 @@ mod tests {
                 .decode(&a.encode(State::default()))
                 .is_none()
         );
+    }
+    fn fixed_pair(target: &str) -> (State, State) {
+        let mut mac = State {
+            direct_supported: true,
+            preferences: Some(crate::preferences::Preferences {
+                input_mode: target.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut pc = State {
+            direct_supported: true,
+            ..Default::default()
+        };
+        if target == "to_mac" {
+            mac.emulation = true
+        } else {
+            pc.emulation = true
+        }
+        (mac, pc)
+    }
+    #[test]
+    fn fixed_modes_use_one_way_input_without_monitor_metadata() {
+        for mode in ["to_mac", "to_pc"] {
+            let (mac, pc) = fixed_pair(mode);
+            let target = if mode == "to_mac" { "mac" } else { "pc" };
+            for (side, local, peer) in [("mac", &mac, &pc), ("pc", &pc, &mac)] {
+                let policy = choose_policy(side, local, Some(peer), Duration::ZERO, &cfg(side));
+                assert_eq!(
+                    (policy.capture, policy.emulation, policy.direct),
+                    if side == target {
+                        (false, true, false)
+                    } else {
+                        (true, false, true)
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn target_agent_keeps_the_physical_route_but_source_agent_isolates_it() {
+        let (mut mac, mut pc) = fixed_pair("to_mac");
+        mac.agent = true;
+        assert!(choose_policy("pc", &pc, Some(&mac), Duration::ZERO, &cfg("pc")).capture);
+        assert!(choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+        pc.agent = true;
+        assert!(!choose_policy("pc", &pc, Some(&mac), Duration::ZERO, &cfg("pc")).capture);
+        assert!(!choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+    }
+    #[test]
+    fn fixed_input_requires_new_peer_readiness_and_preserves_safety_stops() {
+        let (mac, mut pc) = fixed_pair("to_mac");
+        pc.direct_supported = false;
+        assert!(!choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+        pc.direct_supported = true;
+        pc.manual_pause = true;
+        assert!(!choose_policy("pc", &pc, Some(&mac), Duration::ZERO, &cfg("pc")).capture);
+        pc.manual_pause = false;
+        pc.platform.fullscreen = true;
+        assert!(choose_policy("pc", &pc, Some(&mac), Duration::ZERO, &cfg("pc")).capture);
+        pc.platform.fullscreen = false;
+        assert!(!choose_policy("pc", &pc, Some(&mac), Duration::from_secs(7), &cfg("pc")).capture);
+        let mut not_ready = mac;
+        not_ready.emulation = false;
+        assert!(!choose_policy("pc", &pc, Some(&not_ready), Duration::ZERO, &cfg("pc")).capture);
     }
     #[test]
     fn routing_and_protections_use_ddc_not_connected_cable() {

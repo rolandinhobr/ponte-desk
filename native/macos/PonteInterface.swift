@@ -172,7 +172,12 @@ func buildPontePanel(_ owner: AppDelegate) -> NSWindow {
                                           action: #selector(AppDelegate.openPermissions), small: true)
     owner.permissionsButton=permissions
     permissions.toolTip = "Verificar as permissões de controle deste Mac"
-    let inputCard = PonteLayout.card([inputHeading, computerRow,
+    let inputMode=NSPopUpButton()
+    inputMode.addItems(withTitles:["Passar pelas bordas", "Usar os periféricos dos dois neste Mac", "Usar os periféricos dos dois no Windows"])
+    inputMode.target=owner;inputMode.action=#selector(AppDelegate.changeInputMode)
+    inputMode.setAccessibilityLabel("Destino do teclado e mouse")
+    owner.inputMode=inputMode
+    let inputCard = PonteLayout.card([inputHeading, computerRow, inputMode,
         PonteLayout.row([inputState, PonteLayout.spacer(), permissions]), layout, detail], spacing: 8)
 
     let component = PonteLayout.button("Configurar câmera…", owner: owner,

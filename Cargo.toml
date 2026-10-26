@@ -12,7 +12,7 @@ members = [
 [package]
 name = "ponte-desk"
 description = "Integrated local keyboard, mouse, webcam, storage and display control"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 

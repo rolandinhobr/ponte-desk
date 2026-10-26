@@ -20,6 +20,10 @@ pub struct WindowsInputCapture {
 
 #[async_trait]
 impl Capture for WindowsInputCapture {
+    fn direct(&mut self, pos: Option<Position>) -> Result<(), CaptureError> {
+        self.event_thread.direct(pos);
+        Ok(())
+    }
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.event_thread.create(pos);
         Ok(())

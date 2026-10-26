@@ -106,6 +106,7 @@ impl Service {
             config.release_bind(),
             !integration.policy.capture,
         );
+        capture.direct(integration.policy.direct);
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener, !integration.policy.emulation);
 
@@ -158,6 +159,7 @@ impl Service {
                     if stop.exists() { let _=std::fs::remove_file(stop); break; }
                     let changed = self.integration.refresh();
                     if changed {
+                        self.capture.direct(self.integration.policy.direct);
                         log::info!("integration: {}", self.integration.policy.reason);
                         self.capture.suspend(!self.integration.policy.capture);
                         self.emulation.suspend(!self.integration.policy.emulation);
@@ -368,6 +370,9 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::DirectMode(value) => {
+                self.integration.direct_active = value;
+            }
             ICaptureEvent::CaptureBegin(handle) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
@@ -376,6 +381,7 @@ impl Service {
                 }
             }
             ICaptureEvent::CaptureDisabled => {
+                self.integration.direct_active = false;
                 self.capture_status = Status::Disabled;
                 self.integration
                     .write_status(false, self.emulation_status.into(), true);

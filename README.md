@@ -11,7 +11,7 @@ Um aplicativo gratuito e aberto para compartilhar teclado, mouse, webcam externa
 
 ## Escolha o que compartilhar
 
-- **Teclado e mouse:** atravesse a borda entre as telas para controlar o outro computador. Escolha se ele fica à esquerda, à direita, acima ou abaixo.
+- **Teclado e mouse:** use a travessia pelas bordas ou fixe os periféricos dos dois computadores no Mac ou no Windows. No modo fixo, o primeiro movimento ou tecla já vai ao destino, sem trocar telas ou entradas do monitor.
 - **Webcam externa:** deixe o USB em qualquer um dos computadores e compartilhe quando precisar. Captura em 1080p/30 ou 720p/30 para reduzir o tráfego. A câmera começa desligada.
 - **Cartão SD:** publique uma mídia removível em somente leitura e monte no outro computador pelo Finder ou Explorer. Sem copiar o cartão inteiro antes. [Configuração e limites](docs/storage.md).
 - **Monitor compartilhado, opcional:** para quem alterna a entrada de um mesmo monitor entre os computadores. A configuração identifica o monitor e suas entradas; a automação pode reorganizar as telas do Mac e restaurá-las depois.
@@ -55,7 +55,7 @@ cargo build --release --no-default-features
 
 A interface Windows usa WinForms e o .NET Framework incluído no Windows 11, sem WebView ou outro aplicativo residente. A DLL de câmera requer MSVC x64 e Windows SDK 26100. Veja [instalação e pareamento](docs/setup.md), [opções](docs/options.md) e [componente da câmera](docs/camera-component.md). Depois do pareamento, o instalador `scripts/install-windows.ps1` registra a DLL uma vez e inicia o serviço em usuário comum.
 
-**Use a mesma versão nos dois computadores.** A 0.5.1 corrige o encerramento mesmo com operações pendentes e atualiza a verificação do auxiliar de cartões. O controle dos ajustes pelos dois lados exige a versão 0.5. O armazenamento requer a versão 0.4 ou posterior nos dois lados. A versão 0.3 introduz opções autenticadas no protocolo de coordenação; atualize o par junto.
+**Use a mesma versão nos dois computadores.** A 0.6.0 adiciona periféricos fixos e coordenação v4; atualize as duas máquinas juntas. A 0.5.1 corrige o encerramento mesmo com operações pendentes. O controle dos ajustes pelos dois lados exige a versão 0.5. O armazenamento requer a versão 0.4 ou posterior nos dois lados. A versão 0.3 introduz opções autenticadas no protocolo de coordenação; atualize o par junto.
 
 ## Ajustes
 

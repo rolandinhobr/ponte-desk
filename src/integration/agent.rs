@@ -115,14 +115,16 @@ fn isolated(root: &Path, since: u64) -> bool {
             let recent = observer["timestamp"]
                 .as_f64()
                 .is_some_and(|t| (now_ms() as f64 / 1000. - t).abs() < 2.);
+            let fixed_target = observer["input"]["target_local"] == true;
             let local = engine["timestamp_ms"]
                 .as_u64()
                 .is_some_and(|t| t + 1000 >= since)
                 && engine["capture_installed"] == false
-                && engine["emulation_enabled"] == false;
+                && (engine["emulation_enabled"] == false || fixed_target);
             let peer_age = observer["peer_age"].as_f64();
             let peer = &observer["peer_engine"];
-            let remote = peer["capture_installed"] == false
+            let remote = (peer["capture_installed"] == false
+                || (fixed_target && peer["direct_active"] == true))
                 && peer["emulation_enabled"] == false
                 && peer["ack"].as_u64().unwrap_or(0) > 0;
             // An unreachable peer cannot carry input here: both coordinators
@@ -137,46 +139,6 @@ fn isolated(root: &Path, since: u64) -> bool {
     false
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn ambiguous_endpoint_errors_do_not_authorize_automation() {
-        for kind in [
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::Other,
-        ] {
-            assert!(!absent_endpoint_error(&io::Error::from(kind)));
-        }
-        assert!(absent_endpoint_error(&io::Error::from(
-            io::ErrorKind::ConnectionRefused
-        )));
-    }
-    #[test]
-    fn a_live_recorded_process_blocks_the_stopped_path() {
-        let root = std::env::temp_dir().join(format!("ponte-agent-pid-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        atomic_json(
-            &root.join("engine-status.json"),
-            &serde_json::json!({"pid":std::process::id()}),
-        )
-        .unwrap();
-        assert!(!recorded_processes_stopped(&root));
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[cfg(unix)]
-    #[test]
-    fn a_live_ipc_listener_cannot_be_treated_as_a_closed_bridge() {
-        let path =
-            std::env::temp_dir().join(format!("ponte-agent-ipc-{}.sock", std::process::id()));
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert!(!ipc_absent_at(&path));
-        drop(listener);
-        assert!(ipc_absent_at(&path));
-        fs::remove_file(path).unwrap();
-    }
-}
 fn run(args: &[String]) -> Result<(), String> {
     let root = root();
     let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -279,4 +241,45 @@ pub fn dispatch() -> Option<i32> {
             2
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ambiguous_endpoint_errors_do_not_authorize_automation() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!absent_endpoint_error(&io::Error::from(kind)));
+        }
+        assert!(absent_endpoint_error(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+    }
+    #[test]
+    fn a_live_recorded_process_blocks_the_stopped_path() {
+        let root = std::env::temp_dir().join(format!("ponte-agent-pid-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        atomic_json(
+            &root.join("engine-status.json"),
+            &serde_json::json!({"pid":std::process::id()}),
+        )
+        .unwrap();
+        assert!(!recorded_processes_stopped(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_live_ipc_listener_cannot_be_treated_as_a_closed_bridge() {
+        let path =
+            std::env::temp_dir().join(format!("ponte-agent-ipc-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(!ipc_absent_at(&path));
+        drop(listener);
+        assert!(ipc_absent_at(&path));
+        fs::remove_file(path).unwrap();
+    }
 }
