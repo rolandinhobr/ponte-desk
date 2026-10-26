@@ -24,6 +24,6 @@ Copie `target/release/ponte-desk.exe` para `dist/windows/ponte-desk.exe`, `nativ
 
 Certificados e configurações devem ser preservados ao atualizar. Não compartilhe o PEM nem copie a chave privada para outra pessoa.
 
-A instalação cria um atalho no menu Iniciar e inicia o app na bandeja ao entrar no Windows. O painel e o motor pertencem à mesma instalação. Dê dois cliques no símbolo para abrir; fechar a janela a recolhe para a bandeja. Não execute como administrador: o instalador inicia a interface com o token comum do Explorer.
+A instalação cria um atalho no menu Iniciar e inicia o app na bandeja ao entrar no Windows. O painel e o motor pertencem à mesma instalação. Dê dois cliques no símbolo para abrir; fechar a janela encerra o aplicativo. Use Recolher painel no menu para mantê-lo na bandeja. Não execute como administrador: o instalador inicia a interface com o token comum do Explorer.
 
-Antes de atualizar, pare webcam e cartão SD e encerre a interface pela bandeja. O instalador preserva os arquivos de pareamento e recusa substituir uma sessão de mídia ativa. A pausa/retomada vale para o par; as proteções de tela cheia e de agentes continuam sendo aplicadas.
+Antes de atualizar, encerre a interface pela bandeja. O instalador preserva os arquivos de pareamento e recusa substituir uma sessão de mídia ativa. A pausa/retomada vale para o par; as proteções de tela cheia e de agentes continuam sendo aplicadas.

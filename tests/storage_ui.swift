@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var calls: [[String]] = []
     var failUnmount = false
     var malformedPublish = false
+    var publishPreparing = false
     var asyncCallbacks = false
     var holdCallbacks = false
     var deferredCallbacks: [() -> Void] = []
@@ -77,8 +78,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 deliver(completion, ["ok": true, "session": "../invalid", "share": "other-share"])
                 return
             }
-            if remote { remoteHost = state("sharing", active: true) }
-            else { localHost = state("sharing", active: true) }
+            if remote { remoteHost = state(publishPreparing ? "preparing":"sharing", active: !publishPreparing) }
+            else { localHost = state(publishPreparing ? "preparing":"sharing", active: !publishPreparing) }
             deliver(completion, ["ok": true, "session": sessionID,
                                  "share": "PDSD_" + sessionID, "phase": "preparing"])
         case "mount":
@@ -120,7 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Recover an existing Mac -> Windows session, then terminate from a
-        // run-loop block. This intentionally exercises AppKit's modal quit loop.
+        // run-loop block while unmount is still pending. Quit must remain immediate.
         asyncCallbacks = true
         pendingUnmountSeconds = 3
         localHost = state("sharing", active: true)
@@ -139,6 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         afterRemoteStatus = { [weak self] in
             guard let self else { return }
             self.afterRemoteStatus = nil
+            if let view=self.fixtureView,let stop=descendants(view).compactMap({$0 as? NSButton}).first(where:{$0.title=="Desmontar e parar"}) {stop.performClick(nil)}
             RunLoop.main.perform(inModes: [.default, .modalPanel, .eventTracking]) {
                 NSApplication.shared.terminate(nil)
             }
@@ -154,34 +156,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let fixtureController else { return .terminateCancel }
-        fixtureController.prepareToQuit { [weak self] ready in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                require(ready, "Pending unmount caused quit to be cancelled")
-                require(self.modalTicks > 0, "Storage timer did not execute in NSModalPanelRunLoopMode")
-                guard let began = self.unmountStarted, let finished = self.unmountFinished,
-                      let stopped = self.stopObserved else {
-                    require(false, "Quit replied before complete unmount/stop evidence"); return
-                }
-                require(finished.timeIntervalSince(began) >= 2.9, "Fixture did not remain pending for more than two seconds")
-                require(stopped >= finished, "Stop preceded completion of delayed unmount")
-                require(self.remoteMount["phase"] as? String == "unmounted", "Destination still mounted at quit")
-                require(self.localHost["phase"] as? String == "stopped", "Host still sharing at quit")
-                self.quitReply = true
-                sender.reply(toApplicationShouldTerminate: true)
-            }
+        var returned=false
+        fixtureController?.prepareToQuit { ready in
+            require(ready,"A pending or failed storage operation vetoed quit")
+            returned=true
         }
-        return .terminateLater
+        require(returned,"Quit waited on a remote or OS callback")
+        quitReply=true
+        return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        require(quitReply, "Application terminated without the verified asynchronous reply")
+        require(quitReply, "Application terminated without explicit quit authorization")
+        require(unmountStarted != nil && unmountFinished == nil,"Quit fixture did not contain a pending unmount")
+        require(stopObserved == nil,"Quit forced storage teardown before unmount confirmation")
         fixtureTimer?.invalidate()
         watchdog?.cancel()
         fixtureController?.invalidate()
         fixtureFinished = true
-        print("PASS: real windowless NSApplication, modal timer, >2s pending unmount, asynchronous quit")
+        print("PASS: real windowless NSApplication, immediate quit independent of storage state")
         fflush(stdout)
     }
 }
@@ -261,6 +254,19 @@ private func testInvalidSessionAndStaleCallback() {
     print("PASS: malformed session rejected; invalidated callbacks ignored")
 }
 
+private func testLateAuthorizationMountsOnce() {
+    let fixture=Fixture();fixture.selectCard();fixture.owner.publishPreparing=true
+    fixture.action("startSharing")
+    require(!fixture.owner.calls.contains{$0[1]=="mount"},"Mounted before source authorization")
+    fixture.owner.localHost=fixture.owner.state("error",active:false)
+    fixture.controller.refreshAll()
+    fixture.owner.localHost=fixture.owner.state("sharing",active:true)
+    fixture.controller.refreshAll();fixture.controller.refreshAll()
+    require(fixture.owner.calls.filter{$0[1]=="mount"}.count==1,"Late authorization did not mount exactly once")
+    fixture.controller.invalidate()
+    print("PASS: delayed authorization recovers into a single automatic mount")
+}
+
 @main
 private enum StorageUITests {
     static func main() {
@@ -268,10 +274,11 @@ private enum StorageUITests {
         app.setActivationPolicy(.prohibited)
         testDirectionsAndRetry()
         testInvalidSessionAndStaleCallback()
+        testLateAuthorizationMountsOnce()
         fflush(stdout)
         let delegate = AppDelegate()
         app.delegate = delegate
         withExtendedLifetime(delegate) { app.run() }
-        require(delegate.fixtureFinished, "NSApplication returned without completing modal-quit fixture")
+        require(delegate.fixtureFinished, "NSApplication returned without completing immediate-quit fixture")
     }
 }

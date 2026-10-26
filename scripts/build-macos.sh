@@ -24,6 +24,10 @@ if [ -n "${PONTE_DESK_CAMERA_HELPER:-}" ]; then
 else
   "$project_dir/native/macos/camera-extension/prepare-component.sh" "$app/Contents/Helpers"
 fi
+# Finder/File Provider can attach these unsigned presentation attributes while
+# copying a bundle. Remove only those attributes, never quarantine or signatures.
+xattr -dr com.apple.FinderInfo "$app" 2>/dev/null || true
+xattr -dr com.apple.ResourceFork "$app" 2>/dev/null || true
 codesign --verify --deep --strict "$app/Contents/Helpers/CameraComponent.app"
 codesign --force --sign - "$app/Contents/Frameworks/PonteDeskUI.dylib"
 # Deliberately do not use --deep --force: the vendor helper keeps its signature.
@@ -33,6 +37,8 @@ output_dir=${PONTE_DESK_OUTPUT_DIR:-"$project_dir/dist"}
 mkdir -p "$output_dir"
 published=$(mktemp -d "$output_dir/.ponte-desk.XXXXXX")
 ditto --norsrc --noextattr --qtn "$app" "$published/Ponte Desk.app"
+xattr -dr com.apple.FinderInfo "$published/Ponte Desk.app" 2>/dev/null || true
+xattr -dr com.apple.ResourceFork "$published/Ponte Desk.app" 2>/dev/null || true
 codesign --verify --deep --strict "$published/Ponte Desk.app"
 if [ -e "$output_dir/Ponte Desk.app" ]; then
   mv "$output_dir/Ponte Desk.app" "$output_dir/Ponte Desk.previous.$(date +%s).app"

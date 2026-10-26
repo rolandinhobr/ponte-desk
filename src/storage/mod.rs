@@ -132,6 +132,12 @@ fn start_host(id: &str, peer: &str, parent: u32) -> Result<Value, String> {
     ])?);
     Ok(json!({"ok":true,"session":session,"share":share,"phase":"preparing"}))
 }
+fn owns_mount_operation(old: &Value, running: bool, peer: &str, session: &str) -> bool {
+    let protected = running
+        || old["active"] == true
+        || ["mounting", "unmounting"].contains(&old["phase"].as_str().unwrap_or(""));
+    !protected || (old["session"] == session && old["peer"] == peer)
+}
 fn start_mount(peer: &str, share: &str, session: &str, op: &str) -> Result<Value, String> {
     paired(peer)?;
     if !valid_session(session) || share != format!("PDSD_{session}") {
@@ -140,21 +146,25 @@ fn start_mount(peer: &str, share: &str, session: &str, op: &str) -> Result<Value
     let mut guard = controls()
         .lock()
         .map_err(|_| "Storage controller unavailable")?;
-    if guard
+    let running = guard
         .mount
         .as_mut()
-        .is_some_and(|c| c.try_wait().ok() == Some(None))
-    {
-        return Err("A mount operation is already pending".into());
+        .is_some_and(|c| c.try_wait().ok() == Some(None));
+    if op == "unmount" && !owns_mount_operation(&state("mount"), running, peer, session) {
+        return Err("Another card operation is active; it was left unchanged".into());
+    }
+    if running {
+        if op != "unmount" {
+            return Err("A mount operation is already pending".into());
+        }
+        // Identity has been checked before cancelling any owned worker.
+        if let Some(mut child) = guard.mount.take() {
+            child.kill().map_err(|e| e.to_string())?;
+            let _ = child.wait();
+        }
     }
     if op == "mount" && state("mount")["active"] == true {
         return Err("Disconnect the mounted card first".into());
-    }
-    if op == "unmount" {
-        let old = state("mount");
-        if old["active"] == true && (old["session"] != session || old["peer"] != peer) {
-            return Err("Another card is mounted; it was left unchanged".into());
-        }
     }
     save(
         "mount",
@@ -208,10 +218,33 @@ fn stop_host(session: &str, peer: Option<&str>) -> Result<Value, String> {
         save("host", &stopped)?;
         return Ok(json!({"ok":true,"phase":"stopped"}));
     }
+    if s["phase"] == "preparing" && s["pid"].as_u64().is_none() {
+        fs::write(root().join(format!("storage-stop-{session}")), b"stop")
+            .map_err(|e| e.to_string())?;
+        return Ok(json!({"ok":true,"phase":"stopping"}));
+    }
+    let lock_free = fs::OpenOptions::new()
+        .write(true)
+        .open(root().join("storage-host.lock"))
+        .map(|file| file.try_lock().is_ok())
+        .unwrap_or(true);
     if !s["pid"]
         .as_u64()
         .is_some_and(|pid| parent_alive(pid as u32))
+        || lock_free
     {
+        // A failed or cancelled helper may have left only a stale status file.
+        // Reconcile from native OS state; never infer cleanup from a dead PID.
+        if native::call(&json!({"op":"reconcile_host","share":s["share"]}))
+            .is_ok_and(|v| v["cleanup_confirmed"] == true)
+        {
+            let mut closed = s;
+            closed["active"] = json!(false);
+            closed["phase"] = json!("stopped");
+            closed["cleanup_confirmed"] = json!(true);
+            save("host", &closed)?;
+            return Ok(json!({"ok":true,"phase":"stopped"}));
+        }
         return Err("The storage controller is unavailable; cleanup has not been confirmed".into());
     }
     fs::write(root().join(format!("storage-stop-{session}")), b"stop")
@@ -254,6 +287,34 @@ fn host(id: &str, peer: &str, session: &str, parent: u32) -> Result<Value, Strin
     let share = format!("PDSD_{session}");
     let mut base = json!({"active":false,"phase":"preparing","session":session,"share":share,"peer":peer,"volume":volume,"read_only":true,"pid":std::process::id()});
     save("host", &base)?;
+    let early_stop = root().join(format!("storage-stop-{session}"));
+    if early_stop.exists() {
+        let _ = fs::remove_file(early_stop);
+        base["phase"] = json!("stopped");
+        base["cleanup_confirmed"] = json!(true);
+        save("host", &base)?;
+        return Ok(base);
+    }
+    // The native authorization can block before the normal host loop starts.
+    // Parent exit must still cancel this owned worker and drop its XPC/pipe.
+    let watch_session = session.to_owned();
+    std::thread::spawn(move || {
+        loop {
+            if !parent_alive(parent) {
+                let mut current = state("host");
+                if current["session"] == watch_session && current["phase"] != "stopped" {
+                    current["phase"] = json!("error");
+                    current["active"] = json!(true);
+                    current["cleanup_confirmed"] = json!(false);
+                    current["error"] =
+                        json!("O aplicativo foi encerrado. A limpeza será conferida ao retomar.");
+                    let _ = save("host", &current);
+                }
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
     if let Err(error) =
         native::call(&json!({"op":"host","id":id,"peer":peer,"session":session,"share":share}))
     {
@@ -324,6 +385,26 @@ fn mount(peer: &str, share: &str, session: &str, op: &str) -> Result<Value, Stri
             s["error"] = json!(&e);
             save("mount", &s)?;
             Err(e)
+        }
+    }
+}
+/// Cancels owned in-flight workers on engine exit without forcing any volume
+/// unmount or waiting on network/OS credential dialogs.
+pub fn shutdown() {
+    if let Ok(mut children) = controls().try_lock() {
+        if let Some(mut child) = children.mount.take() {
+            if child.try_wait().ok() == Some(None) {
+                let mut current = state("mount");
+                current["phase"] = json!("error");
+                current["active"] = json!(true);
+                current["error"] =
+                    json!("Operação interrompida ao encerrar. Desmonte normalmente ao retomar.");
+                let _ = save("mount", &current);
+                let _ = child.kill();
+            }
+        }
+        if let Some(mut child) = children.host.take() {
+            let _ = child.kill();
         }
     }
 }
@@ -442,6 +523,36 @@ pub fn dispatch() -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_mount_cancellation_cannot_touch_another_session_or_peer() {
+        let current =
+            json!({"active":false,"phase":"mounting","session":"current","peer":"192.0.2.10"});
+        assert!(owns_mount_operation(
+            &current,
+            true,
+            "192.0.2.10",
+            "current"
+        ));
+        assert!(!owns_mount_operation(&current, true, "192.0.2.10", "other"));
+        assert!(!owns_mount_operation(
+            &current,
+            false,
+            "192.0.2.11",
+            "current"
+        ));
+        assert!(!owns_mount_operation(
+            &current,
+            false,
+            "192.0.2.10",
+            "other"
+        ));
+        assert!(owns_mount_operation(
+            &json!({"active":false,"phase":"unmounted"}),
+            false,
+            "192.0.2.10",
+            "new"
+        ));
+    }
     #[test]
     fn invalid_controller_pids_are_not_process_groups() {
         assert!(!parent_alive(0));

@@ -13,6 +13,7 @@ final class PonteStorageController: NSObject {
     }
     private var session: Session?
     private var phase: Phase = .idle
+    private var wantsMount=false
     private var host: [String: Any] = [:]
     private var mount: [String: Any] = [:]
     private var commandBusy = false
@@ -215,6 +216,7 @@ final class PonteStorageController: NSObject {
                 self.fail("O compartilhamento não retornou uma sessão válida. Atualize para conferir o estado."); return
             }
             self.session = Session(id: id, share: share, peer: peer, sourceRemote: remote)
+            self.wantsMount=true
             self.host = [:]; self.mount = [:]
             self.updateView(); self.pollStatus(force: true)
         }
@@ -222,6 +224,7 @@ final class PonteStorageController: NSObject {
 
     private func beginMount(_ value: Session) {
         guard !commandBusy else { return }
+        wantsMount=false
         phase = .mounting; commandBusy = true; operationStarted = Date()
         message("Montando o cartão no destino, somente leitura…")
         run(destination("mount", value)) { [weak self] result in
@@ -233,6 +236,7 @@ final class PonteStorageController: NSObject {
 
     @objc private func stopSharing() {
         guard !commandBusy, !operating, let value = session else { return }
+        wantsMount=false
         phase = .unmounting; commandBusy = true; operationStarted = Date()
         message("Desmontando no destino antes de encerrar o compartilhamento…")
         run(destination("unmount", value)) { [weak self] result in
@@ -364,7 +368,7 @@ final class PonteStorageController: NSObject {
             if let completion = quitCompletion { quitCompletion = nil; completion(true) }
             return
         }
-        if phase == .preparing && hostPhase == "sharing" { beginMount(value); return }
+        if wantsMount && hostPhase == "sharing" && ![Phase.unmounting,.stopping].contains(phase) {beginMount(value);return}
         if phase == .unmounting && mountPhase == "unmounted" {
             if hostPhase == "stopped" { session = nil; phase = .idle }
             else { stopHost(value) }
@@ -386,16 +390,10 @@ final class PonteStorageController: NSObject {
         updateView()
     }
 
-    /// Normal quit preserves the unmount-before-stop ordering. Crash cleanup is
-    /// owned by the native host's parent-process watchdog, not by this UI.
+    /// Closing the application cannot depend on remote storage state. The
+    /// native host watchdog owns disconnect cleanup when its parent exits.
     func prepareToQuit(_ completion: @escaping (Bool) -> Void) {
-        guard owner?.preview != true else { completion(true); return }
-        guard quitCompletion == nil else { completion(false); return }
-        quitCompletion = completion
-        if operating || commandBusy {
-            quitCompletion = nil; message("Aguarde a operação do cartão terminar antes de encerrar.", error: true); completion(false); return
-        }
-        if session != nil { stopSharing() } else { pollStatus(force: true) }
+        invalidate();completion(true)
     }
 
     func invalidate() {

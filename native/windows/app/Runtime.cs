@@ -29,6 +29,10 @@ internal sealed class Runtime {
     private readonly SemaphoreSlim commands=new SemaphoreSlim(1,1);
     internal bool Preview;
     private string cachedPeer;
+    private volatile bool stopping;
+    private readonly CancellationTokenSource lifetime=new CancellationTokenSource();
+    private readonly object childLock=new object();
+    private readonly List<Process> children=new List<Process>();
     internal Runtime(string root,string core,bool preview) {Root=root;Core=core;Preview=preview;}
     internal Dictionary<string,object> Read(string name) {return Json.Read(Path.Combine(Root,name));}
     // Windows CRT argument escaping, including quotes and trailing backslashes.
@@ -48,11 +52,12 @@ internal sealed class Runtime {
     }
     internal async Task<Dictionary<string,object>> Command(params string[] args) {
         if(Preview)throw new InvalidOperationException("Prévia: nenhuma operação real foi enviada.");
-        await commands.WaitAsync();
+        await commands.WaitAsync(lifetime.Token);
         try {
             var info=new ProcessStartInfo(Core,string.Join(" ",args.Select(Quote))){UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true,StandardOutputEncoding=Encoding.UTF8,StandardErrorEncoding=Encoding.UTF8,WorkingDirectory=Path.GetDirectoryName(Core)};
             info.EnvironmentVariables["PONTE_DESK_HOME"]=Root;
-            using(var process=Process.Start(info)){
+            Process started;lock(childLock){if(stopping)throw new OperationCanceledException();started=Process.Start(info);children.Add(started);}
+            using(var process=started){
                 Task<string> output=process.StandardOutput.ReadToEndAsync(),error=process.StandardError.ReadToEndAsync();
                 await Task.Run(()=>process.WaitForExit());
                 string stdout=await output,stderr=await error;
@@ -60,7 +65,7 @@ internal sealed class Runtime {
                 try{result=Json.Parse(stdout.Trim());}catch{try{result=Json.Parse(stderr.Trim().Split('\n').Last());}catch{throw new InvalidOperationException("Não foi possível concluir a operação. Confira a conexão e as autorizações do sistema.");}}
                 Json.Check(result);if(process.ExitCode!=0)throw new InvalidOperationException("O sistema não confirmou a operação.");return result;
             }
-        } finally {commands.Release();}
+        } finally {lock(childLock){children.RemoveAll(p=>{try{return p.HasExited;}catch{return true;}});}commands.Release();}
     }
     internal Process CoreProcess() {
         try {var state=Read("engine-status.json");int pid=(int)Json.Number(state,"pid");if(pid<2)return null;var p=Process.GetProcessById(pid);if(p.HasExited || !string.Equals(p.MainModule.FileName,Core,StringComparison.OrdinalIgnoreCase)){p.Dispose();return null;}return p;}catch{return null;}
@@ -75,6 +80,18 @@ internal sealed class Runtime {
     internal async Task Bridge(bool enabled) {await Command("settings","bridge","--enabled",enabled?"true":"false","--peer",await Peer());}
     internal bool Paused {get{return File.Exists(Path.Combine(Root,"manual-pause"))||Json.Flag(Read("observer-status.json"),"peer_paused");}}
     internal async Task StopCamera() {await Command("webcam","stop-local");await Command("webcam","stop","--peer",await Peer());}
+    internal async Task ExitNow() {
+        stopping=true;lifetime.Cancel();Process[] pending;
+        lock(childLock){pending=children.ToArray();children.Clear();}
+        foreach(var process in pending){try{if(!process.HasExited)process.Kill();}catch{}}
+        try{Directory.CreateDirectory(Root);File.WriteAllText(Path.Combine(Root,"webcam-stop"),Guid.NewGuid().ToString("N"));}catch{}
+        using(var core=CoreProcess()){
+            if(core==null)return;
+            try{File.WriteAllText(Path.Combine(Root,"engine-stop-"+core.Id),"stop");}catch{}
+            bool done=await Task.Run(()=>{try{return core.WaitForExit(1300);}catch{return true;}});
+            if(!done){try{if(!core.HasExited)core.Kill();}catch{}}
+        }
+    }
     internal async Task StopCore() {using(var p=CoreProcess()){if(p==null)return;await Command("settings","shutdown","--pid",p.Id.ToString());if(!await Task.Run(()=>p.WaitForExit(10000)))throw new InvalidOperationException("O motor ainda está encerrando. Tente novamente.");}}
 }
 internal sealed class Choice {

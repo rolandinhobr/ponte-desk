@@ -1,4 +1,4 @@
-param([string]$Output=(Join-Path $PSScriptRoot '..\dist\PonteDesk-0.5.0-preview-windows.zip'))
+param([string]$Output=(Join-Path $PSScriptRoot '..\dist\PonteDesk-0.5.1-preview-windows.zip'))
 $ErrorActionPreference='Stop'
 $project=Split-Path $PSScriptRoot
 $stage=Join-Path ([IO.Path]::GetTempPath()) ('PonteDesk-package-'+[guid]::NewGuid().ToString('N'))

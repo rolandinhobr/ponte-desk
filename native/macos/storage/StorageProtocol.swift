@@ -1,5 +1,6 @@
 import Foundation
 @objc(PonteStorageHelperProtocol) protocol PonteStorageHelperProtocol {
+    func ping(withReply reply:@escaping(Data)->Void)
     func publish(_ request:Data, authorization:Data, withReply reply:@escaping(Data)->Void)
     func status(withReply reply:@escaping(Data)->Void)
     func stop(withReply reply:@escaping(Data)->Void)
@@ -12,4 +13,11 @@ func storageRun(_ executable:String,_ args:[String])throws->Data {
     let process=Process();let output=Pipe();let errors=Pipe();process.executableURL=URL(fileURLWithPath:executable);process.arguments=args;process.standardOutput=output;process.standardError=errors
     try process.run();let data=output.fileHandleForReading.readDataToEndOfFile();let err=errors.fileHandleForReading.readDataToEndOfFile();process.waitUntilExit()
     guard process.terminationStatus==0 else{throw StorageFailure(message:String(data:err,encoding:.utf8)?.trimmingCharacters(in:.whitespacesAndNewlines).prefix(300).description ?? "Falha na operação do sistema.")};return data
+}
+
+func storageShares()throws->[String:[String:Any]] {
+    let data=try storageRun("/usr/sbin/sharing",["-l","-f","json"])
+    if String(data:data,encoding:.utf8)?.trimmingCharacters(in:.whitespacesAndNewlines)=="No share point records." {return [:]}
+    guard let value=try JSONSerialization.jsonObject(with:data) as? [String:[String:Any]] else{throw StorageFailure(message:"Não foi possível confirmar os compartilhamentos do sistema.")}
+    return value
 }

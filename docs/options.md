@@ -27,4 +27,4 @@ Autenticação, liberação de teclas, proteção em falha de rede e isolamento 
 
 O mesmo símbolo aparece no Mac e no Windows. O menu oferece abrir o painel, pausar/retomar teclado e mouse, ajustes, parar webcam e encerrar. Pausar em um lado pausa o par; retomar limpa as pausas manuais nos dois. Isso não remove o isolamento de agentes nem ignora tela cheia.
 
-No Windows, a janela pode ficar fechada sem interromper uma sessão. Encerrar desmonta o cartão normalmente e aguarda a limpeza antes de fechar o motor. Se houver arquivos ocupados ou uma autorização pendente, o app preserva a sessão e informa a pendência.
+Use Recolher painel para ocultar a janela sem interromper uma sessão. Encerrar nunca espera autorizações, rede ou arquivos ocupados: cancela os comandos próprios e fecha o motor com prazo limitado. Não força a desmontagem de volumes. Uma limpeza não confirmada permanece registrada para conferência ao reabrir.

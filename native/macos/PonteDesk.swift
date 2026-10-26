@@ -4,7 +4,7 @@ import Darwin
 import AVFoundation
 
 // Native, lightweight interface for the integrated Ponte Desk service.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     let root = ProcessInfo.processInfo.environment["PONTE_DESK_HOME"].map{URL(fileURLWithPath:$0)} ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/ponte-desk")
     var cameraProcess: Process?
     var cameraLocal: NSPopUpButton?
@@ -88,6 +88,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.command(["settings","layout","--position",position]){result in if let error=result["error"] as? String{completion(error)}else{persist()}}
         }
     }
+    private let commandLock=NSLock()
+    private var commandProcesses=[Process]()
+    private var shuttingDown=false
     func command(_ arguments:[String],completion:@escaping([String:Any])->Void){
         if preview {completion([:]);return}
         let executable=Bundle.main.executableURL
@@ -95,8 +98,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let process=Process();process.executableURL=executable;process.arguments=arguments
             let pipe=Pipe();process.standardOutput=pipe;process.standardError=FileHandle.nullDevice
             var result:[String:Any]=[:]
-            do{try process.run();let data=pipe.fileHandleForReading.readDataToEndOfFile();process.waitUntilExit();result=(try? JSONSerialization.jsonObject(with:data) as? [String:Any]) ?? [:];if process.terminationStatus != 0 && result["error"]==nil{result=["error":"Não foi possível comunicar com o outro computador."]}}catch{result=["error":error.localizedDescription]}
-            DispatchQueue.main.async{completion(result)}
+            do{
+                self.commandLock.lock()
+                if self.shuttingDown {self.commandLock.unlock();return}
+                do{try process.run();self.commandProcesses.append(process);self.commandLock.unlock()}catch{self.commandLock.unlock();throw error}
+                let data=pipe.fileHandleForReading.readDataToEndOfFile();process.waitUntilExit();result=(try? JSONSerialization.jsonObject(with:data) as? [String:Any]) ?? [:];if process.terminationStatus != 0 && result["error"]==nil{result=["error":"Não foi possível comunicar com o outro computador."]}}catch{result=["error":error.localizedDescription]}
+            self.commandLock.lock();self.commandProcesses.removeAll{$0 === process};let stopped=self.shuttingDown;self.commandLock.unlock()
+            if !stopped {DispatchQueue.main.async{completion(result)}}
         }
     }
 
@@ -197,12 +205,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let toggle = NSMenuItem(title: paused ? "Retomar teclado e mouse" : "Pausar teclado e mouse", action: #selector(togglePause), keyEquivalent: ""); toggle.target = self; menu.addItem(toggle)
         let settings=NSMenuItem(title:"Ajustes…",action:#selector(showSettings),keyEquivalent:",");settings.target=self;menu.addItem(settings)
         let cameraStop=NSMenuItem(title:"Parar compartilhamento da webcam",action:#selector(stopWebcam),keyEquivalent:"");cameraStop.target=self;menu.addItem(cameraStop)
+        let hide=NSMenuItem(title:"Recolher painel",action:#selector(hidePanel),keyEquivalent:"");hide.target=self;menu.addItem(hide)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Encerrar Ponte Desk", action: #selector(quit), keyEquivalent: "q"); quit.target = self; menu.addItem(quit)
     }
 
     @objc func showPanel(){
-        if panel==nil{panel=buildPontePanel(self);cameraOrigin?.selectedSegment=UserDefaults.standard.integer(forKey:"webcamOrigin");cameraOriginChanged();refreshCameras()}
+        if panel==nil{panel=buildPontePanel(self);panel?.delegate=self;cameraOrigin?.selectedSegment=UserDefaults.standard.integer(forKey:"webcamOrigin");cameraOriginChanged();refreshCameras()}
         refreshPanel();panel?.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
         storage.refreshAll()
     }
@@ -311,22 +320,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func installCameraDriver(){beginCameraSetup()}
     @objc func toggleDisplays(){var values=options;values["manage_displays"]=autoDisplaySwitch?.state == .on;saveOptions(values,position:peerPosition){[weak self] error in if let error{self?.monitorStatus?.stringValue=error}}}
     @objc func restoreDisplays(){guard !preview else{return};var values=options;values["manage_displays"]=false;saveOptions(values,position:peerPosition){_ in};displays.lastEnable=nil;displays.update(enable:true,root:root)}
+    @objc func hidePanel(){panel?.orderOut(nil)}
     @objc func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
-        if preview{return .terminateNow}
-        storage.prepareToQuit { [weak self] ready in
-            DispatchQueue.main.async {
-                if !ready {self?.showPanel()}
-                sender.reply(toApplicationShouldTerminate:ready)
-            }
-        }
-        return .terminateLater
+        // Quitting is an unconditional user command. Storage/network health
+        // must never veto or defer it, including Cmd+Q and the window close.
+        .terminateNow
+    }
+    func windowShouldClose(_ sender:NSWindow)->Bool {
+        if sender === panel {quit();return false}
+        return true
     }
     func applicationWillTerminate(_ notification: Notification) {
-        timer?.invalidate()
-        storage.invalidate()
-        if let cameraProcess=cameraProcess,cameraProcess.isRunning{cameraProcess.interrupt()}
-        if let observer=observer, observer.isRunning { kill(observer.processIdentifier, SIGINT) }
+        timer?.invalidate();storage.invalidate()
+        commandLock.lock();shuttingDown=true;let commands=commandProcesses;commandProcesses.removeAll();commandLock.unlock()
+        for process in commands where process.isRunning {process.terminate()}
+        if let cameraProcess,cameraProcess.isRunning{cameraProcess.interrupt()}
+        if let observer,observer.isRunning {
+            observer.interrupt()
+            // A local process deadline, not a remote round trip. Normal SIGINT
+            // releases keys/buttons; a stuck owned engine cannot retain the app.
+            let deadline=Date().addingTimeInterval(0.7)
+            while observer.isRunning && Date()<deadline {Thread.sleep(forTimeInterval:0.02)}
+            if observer.isRunning {kill(observer.processIdentifier,SIGKILL)}
+        }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool { false }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool { showPanel(); return true }

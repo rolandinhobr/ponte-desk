@@ -53,3 +53,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./native/windows/app/build.ps1
+      - name: macOS explicit quit with blocked operation
+        if: runner.os == 'macOS'
+        run: ./scripts/test-macos-exit.sh

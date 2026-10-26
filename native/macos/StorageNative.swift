@@ -3,15 +3,16 @@ import Foundation
 import NetFS
 import Security
 import ServiceManagement
+import CryptoKit
 import Darwin
 private var storageConnection:NSXPCConnection?
 private var storageHostError:String?
 private let storageStateLock=NSLock()
-private func storageProxyCall(_ connection:NSXPCConnection,_ invoke:(PonteStorageHelperProtocol,@escaping(Data)->Void)->Void)throws->[String:Any]{
+private func storageProxyCall(_ connection:NSXPCConnection, timeout:Double=8,_ invoke:(PonteStorageHelperProtocol,@escaping(Data)->Void)->Void)throws->[String:Any]{
     let semaphore=DispatchSemaphore(value:0);let lock=NSLock();var bytes:Data?;var failure:String?
     let finish:(Data)->Void={data in lock.lock();bytes=data;lock.unlock();semaphore.signal()}
     guard let proxy=connection.remoteObjectProxyWithErrorHandler({error in lock.lock();failure=error.localizedDescription;lock.unlock();semaphore.signal()}) as? PonteStorageHelperProtocol else{throw StorageFailure(message:"Serviço de armazenamento indisponível.")}
-    invoke(proxy,finish);guard semaphore.wait(timeout:.now()+120) == .success else{connection.invalidate();throw StorageFailure(message:"A autorização do armazenamento expirou.")}
+    invoke(proxy,finish);guard semaphore.wait(timeout:.now()+timeout) == .success else{connection.invalidate();throw StorageFailure(message:"O auxiliar do cartão não respondeu. Use Configurar para reparar o componente antes de tentar novamente.")}
     lock.lock();defer{lock.unlock()};if let failure{throw StorageFailure(message:failure)}
     guard let bytes,let response=try JSONSerialization.jsonObject(with:bytes) as? [String:Any] else{throw StorageFailure(message:"Resposta do serviço inválida.")}
     if let error=response["error"] as? String{throw StorageFailure(message:error)};return response
@@ -22,6 +23,34 @@ private func storageAuthorization()throws->(AuthorizationRef,Data){
     guard result==errAuthorizationSuccess else{AuthorizationFree(auth,[]);throw StorageFailure(message:"A criação do compartilhamento não foi autorizada.")}
     var form=AuthorizationExternalForm();guard AuthorizationMakeExternalForm(auth,&form)==errAuthorizationSuccess else{AuthorizationFree(auth,[]);throw StorageFailure(message:"A autorização não pôde ser transmitida ao serviço.")}
     return (auth,withUnsafeBytes(of:&form){Data($0)})
+}
+private func storageServiceReady()throws->[String:Any] {
+    let service=SMAppService.daemon(plistName:ponteStorageService+".plist")
+    let root=ProcessInfo.processInfo.environment["PONTE_DESK_HOME"].map{URL(fileURLWithPath:$0)} ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/ponte-desk")
+    let receipt=root.appendingPathComponent("storage-helper-registration.json")
+    let helper=Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/ponte-storage-helper")
+    let digest=SHA256.hash(data:try Data(contentsOf:helper)).map{String(format:"%02x",$0)}.joined()
+    let version=Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+    let stamp=version+":"+digest
+    let previous=(try? Data(contentsOf:receipt)).flatMap{String(data:$0,encoding:.utf8)}
+    if previous != stamp && service.status != .notRegistered && service.status != .notFound {
+        guard try storageShares().keys.allSatisfy({!storageOwnedName($0)}) else{throw StorageFailure(message:"Encerre o compartilhamento do cartão antes de atualizar o auxiliar.")}
+        let done=DispatchSemaphore(value:0);let lock=NSLock();var failure:Error?
+        service.unregister {error in lock.lock();failure=error;lock.unlock();done.signal()}
+        guard done.wait(timeout:.now()+5) == .success else{throw StorageFailure(message:"O sistema ainda está atualizando o auxiliar. Tente Configurar novamente.")}
+        lock.lock();let error=failure;lock.unlock();if let error{throw error}
+    }
+    if service.status == .notRegistered || service.status == .notFound {
+        do{try service.register();try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true);try Data(stamp.utf8).write(to:receipt,options:.atomic)}
+        catch{if service.status == .requiresApproval || (error as NSError).code == 1{return ["ok":true,"ready":false,"approval_required":true,"message":"Ative Ponte Desk em Atividade de Apps em 2º Plano, nos Itens de Início de Sessão e Extensões."]};throw error}
+    }
+    guard service.status == .enabled else{return ["ok":true,"ready":false,"approval_required":service.status == .requiresApproval,"message":"Autorize o auxiliar do Ponte Desk em Itens de Início de Sessão e Extensões."]}
+    let connection=NSXPCConnection(machServiceName:ponteStorageService,options:.privileged)
+    connection.setCodeSigningRequirement("identifier \"br.com.ponte-desk.storage-helper\"")
+    connection.remoteObjectInterface=NSXPCInterface(with:PonteStorageHelperProtocol.self);connection.resume();defer{connection.invalidate()}
+    let response=try storageProxyCall(connection,timeout:5){$0.ping(withReply:$1)}
+    guard response["protocol"] as? Int == 2 else{throw StorageFailure(message:"O auxiliar instalado está desatualizado. Configure o componente novamente.")}
+    return ["ok":true,"ready":true,"approval_required":false,"message":"Auxiliar conectado e atualizado. O cartão pode ser compartilhado em somente leitura."]
 }
 private func storageMounted(_ peer:String,_ share:String)->String? {
     guard storageOwnedName(share) else{return nil}
@@ -36,20 +65,13 @@ private func storageNative(_ r:[String:Any])throws->[String:Any]{
     let op=r["op"] as? String ?? ""
     switch op {
     case "list":return ["volumes":storageVolumes().map{volume -> [String:Any] in var publicVolume=volume;publicVolume.removeValue(forKey:"path");publicVolume["name"]=String((volume["name"] as? String ?? "Cartão SD").prefix(96));return publicVolume},"platform":"mac"]
-    case "prepare":
-        let service=SMAppService.daemon(plistName:ponteStorageService+".plist")
-        if service.status == .notRegistered || service.status == .notFound {
-            do {try service.register()}
-            catch {
-                if service.status == .requiresApproval || (error as NSError).code == 1 {
-                    return ["ok":true,"ready":false,"approval_required":true,"message":"Ative Ponte Desk em Atividade de Apps em 2º Plano, nos Itens de Início de Sessão e Extensões, e configure novamente."]
-                }
-                throw error
-            }
-        }
-        return ["ok":true,"ready":service.status == .enabled,"approval_required":service.status == .requiresApproval,"message":service.status == .enabled ? "Serviço pronto. Ative SMB e uma conta de acesso nos Ajustes de Compartilhamento de Arquivos." : "Autorize o serviço do Ponte Desk em Geral → Itens de Início de Sessão e Extensões."]
+    case "prepare":return try storageServiceReady()
+    case "reconcile_host":
+        guard let share=r["share"] as? String,storageOwnedName(share) else{throw StorageFailure(message:"Sessão inválida.")}
+        guard try storageShares()[share]==nil else{throw StorageFailure(message:"O compartilhamento ainda existe. Configure o auxiliar para concluir a limpeza.")}
+        return ["ok":true,"cleanup_confirmed":true]
     case "host":
-        guard SMAppService.daemon(plistName:ponteStorageService+".plist").status == .enabled else{throw StorageFailure(message:"Configure e autorize o serviço de armazenamento primeiro.")}
+        guard try storageServiceReady()["ready"] as? Bool == true else{throw StorageFailure(message:"Configure e autorize o auxiliar do cartão primeiro.")}
         guard let id=r["id"] as? String,let share=r["share"] as? String,storageOwnedName(share) else{throw StorageFailure(message:"Cartão inválido.")};_ = try storageFindVolume(id)
         let (auth,data)=try storageAuthorization();defer{AuthorizationFree(auth,[])}
         let connection=NSXPCConnection(machServiceName:ponteStorageService,options:.privileged);connection.setCodeSigningRequirement("identifier \"br.com.ponte-desk.storage-helper\"");connection.remoteObjectInterface=NSXPCInterface(with:PonteStorageHelperProtocol.self)

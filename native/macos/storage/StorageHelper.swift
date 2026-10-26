@@ -15,12 +15,9 @@ private func secureRegistry()throws {
         guard lstat(directory.path,&info)==0,info.st_uid==0,info.st_mode & S_IFMT == S_IFDIR,info.st_mode & 0o022==0 else{throw StorageFailure(message:"O diretório do serviço não é seguro.")}
     }
 }
-private func shares()->[String:[String:Any]] {
-    guard let data=try? storageRun("/usr/sbin/sharing",["-l","-f","json"]),let result=try? JSONSerialization.jsonObject(with:data) as? [String:[String:Any]] else{return [:]};return result
-}
 private func removeOwned(_ name:String,_ path:String)throws {
     guard storageOwnedName(name) else{throw StorageFailure(message:"Identidade do compartilhamento inválida.")}
-    if let actual=shares()[name] {guard actual["path"] as? String==path,actual["smb_name"] as? String==name else{throw StorageFailure(message:"O compartilhamento foi alterado fora do Ponte Desk.")};_ = try storageRun("/usr/sbin/sharing",["-r",name])}
+    if let actual=try storageShares()[name] {guard actual["path"] as? String==path,actual["smb_name"] as? String==name else{throw StorageFailure(message:"O compartilhamento foi alterado fora do Ponte Desk.")};_ = try storageRun("/usr/sbin/sharing",["-r",name])}
     try? FileManager.default.removeItem(at:registry.appendingPathComponent(name+".json"))
 }
 private func authorized(_ bytes:Data)->Bool {
@@ -31,6 +28,7 @@ private func authorized(_ bytes:Data)->Bool {
 }
 private final class StorageSession:NSObject,PonteStorageHelperProtocol {
     private var record:[String:Any]?
+    func ping(withReply reply:@escaping(Data)->Void){reply(storageJSON(["ok":true,"protocol":2]))}
     func publish(_ request:Data,authorization:Data,withReply reply:@escaping(Data)->Void){queue.async{
         do {
             guard authorized(authorization),request.count<=4096,let r=try JSONSerialization.jsonObject(with:request) as? [String:Any],let id=r["id"] as? String,let name=r["share"] as? String,storageOwnedName(name),self.record==nil else{throw StorageFailure(message:"Autorize a criação deste compartilhamento de cartão.")}
@@ -38,7 +36,7 @@ private final class StorageSession:NSObject,PonteStorageHelperProtocol {
             try secureRegistry()
             let pending=storageJSON(["share":name,"path":path,"id":id]);try pending.write(to:registry.appendingPathComponent(name+".json"),options:.atomic)
             do {_ = try storageRun("/usr/sbin/sharing",["-a",path,"-n",name,"-S",name,"-s","001","-g","000","-R","1","-E","1"])
-                guard let check=shares()[name],check["path"] as? String==path,(check["smb_read_only"] as? NSNumber)?.boolValue==true,(check["smb_guest_access"] as? NSNumber)?.boolValue==false,(check["smb_sealed"] as? NSNumber)?.boolValue==true else{throw StorageFailure(message:"O sistema não confirmou o acesso somente leitura e criptografado.")}
+                guard let check=try storageShares()[name],check["path"] as? String==path,(check["smb_read_only"] as? NSNumber)?.boolValue==true,(check["smb_guest_access"] as? NSNumber)?.boolValue==false,(check["smb_sealed"] as? NSNumber)?.boolValue==true else{throw StorageFailure(message:"O sistema não confirmou o acesso somente leitura e criptografado.")}
                 self.record=["share":name,"path":path,"id":id];reply(storageJSON(["ok":true,"active":true,"read_only":true]))
             }catch{try? removeOwned(name,path);throw error}
         }catch{reply(storageJSON(["error":error.localizedDescription]))}
@@ -63,7 +61,7 @@ private final class StorageListener:NSObject,NSXPCListenerDelegate {
         let session=StorageSession();queue.sync{count+=1;sessions.append(session)}
         connection.setCodeSigningRequirement("identifier \"br.com.ponte-desk.app\"")
         connection.exportedInterface=NSXPCInterface(with:PonteStorageHelperProtocol.self);connection.exportedObject=session
-        connection.invalidationHandler={queue.async{session.cleanup();self.count-=1;self.sessions.removeAll{$0 === session};if self.count==0{exit(0)}}}
+        connection.invalidationHandler={queue.async{session.cleanup();self.count-=1;self.sessions.removeAll{$0 === session};if self.count==0{queue.asyncAfter(deadline:.now()+15){if self.count==0{exit(0)}}}}}
         connection.resume();return true
     }
 }

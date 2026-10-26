@@ -35,3 +35,9 @@ O pareamento do Ponte Desk autentica os comandos de controle; o SMB autentica se
 A velocidade depende do cartão, leitor e rede. Transferências podem disputar largura de banda com outros usos da rede. A captura de teclado/mouse não processa bytes do cartão.
 
 Interrupções abruptas do auxiliar podem impedir confirmar a limpeza. Nesse caso, o aplicativo mostra erro e não declara a sessão encerrada; revise os compartilhamentos do sistema antes de retirar a mídia. Os compartilhamentos Windows são temporários e não persistem a uma reinicialização do servidor SMB.
+
+## Encerrar e recuperar erros
+
+Fechar a janela ou escolher **Encerrar Ponte Desk** sempre encerra o app, mesmo se a rede estiver indisponível, houver um pedido de autorização aberto ou o cartão estiver em erro. O encerramento cancela os comandos próprios com um prazo local limitado. Não força a desmontagem de volumes e não declara uma limpeza desconhecida como concluída.
+
+O botão **Desmontar e parar** continua usando desmontagem normal e recusa arquivos ocupados. Se o controlador já saiu, o Mac confere a lista real de compartilhamentos para liberar uma sessão antiga. A atualização do auxiliar é vinculada à versão do aplicativo e à assinatura/conteúdo do componente; o app testa uma conexão real com ele antes de pedir autorização para publicar o cartão. Se o macOS solicitar aprovação em Atividade de Apps em 2º Plano, ela precisa ser renovada para o componente atualizado.

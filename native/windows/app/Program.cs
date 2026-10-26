@@ -15,6 +15,7 @@ internal static class Program {
         if(args.Contains("--self-test"))return SelfTest.Run();
         if(args.Length==2 && args[0]=="--export-icon"){Artwork.ExportIcon(args[1]);return 0;}
         Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
+        if(args.Contains("--ui-exit-test"))return SelfTest.RunWindowExit();
         if(args.Length==2 && args[0]=="--render-preview"){using(var show=new EventWaitHandle(false,EventResetMode.AutoReset))using(var app=new Desk(new Runtime(Path.Combine(Path.GetTempPath(),"ponte-preview-no-runtime"),"",true),show,true)){app.Export(args[1]);}return 0;}
         string root=Environment.GetEnvironmentVariable("PONTE_DESK_HOME")??Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"PonteDesk");
         bool preview=args.Contains("--preview");
@@ -46,7 +47,7 @@ internal sealed class Desk:ApplicationContext {
     private Button input,cameraStart,cameraStop,sdStart,sdStop,sdOpen,sdRefresh;
     private ComboBox cameraOrigin,cameras,quality,cardOrigin,cards;
     private CheckBox autoDisplays;private Panel monitorSection;
-    private string feedback;private bool busy,polling,exiting;private int ticks;private bool? iconPaused;
+    private string feedback;private bool busy,polling,exiting;private System.Threading.Timer exitDeadline;private int ticks;private bool? iconPaused;
     internal Desk(Runtime value,EventWaitHandle show,bool background){
         runtime=value;storage=new Storage(runtime);Build();var handle=panel.Handle;
         activation=ThreadPool.RegisterWaitForSingleObject(show,(state,timed)=>{if(panel.IsHandleCreated)panel.BeginInvoke((Action)Show);},null,-1,false);
@@ -64,7 +65,7 @@ internal sealed class Desk:ApplicationContext {
     private FlowLayoutPanel Section(string title,params Control[] controls){var section=new FlowLayoutPanel{Width=490,AutoSize=true,FlowDirection=FlowDirection.TopDown,WrapContents=false,BackColor=Artwork.Surface,MinimumSize=new Size(490,0),MaximumSize=new Size(490,0),Padding=new Padding(14),Margin=new Padding(0,0,0,12)};section.Controls.Add(Label(title,true));section.Controls.AddRange(controls);content.Controls.Add(section);return section;}
     private void Build(){
         panel.Text="Ponte Desk";panel.ClientSize=new Size(548,760);panel.MinimumSize=new Size(540,580);panel.StartPosition=FormStartPosition.CenterScreen;panel.AutoScaleMode=AutoScaleMode.Dpi;panel.Font=new Font("Segoe UI",9.5f);panel.BackColor=Artwork.Background;
-        panel.FormClosing+=(s,e)=>{if(!exiting){e.Cancel=true;panel.Hide();}};
+        panel.FormClosing+=async(s,e)=>{if(!exiting){e.Cancel=true;await Quit();}};
         panel.HandleCreated+=(s,e)=>Artwork.Chrome(panel);
         var header=new Panel{Dock=DockStyle.Top,Height=106,Padding=new Padding(25,20,20,0),BackColor=Artwork.Background};
         var mark=new PictureBox{Image=Artwork.Mark(48,false,true,false),Location=new Point(25,24),Size=new Size(48,48)};header.Controls.Add(mark);
@@ -89,10 +90,12 @@ internal sealed class Desk:ApplicationContext {
         monitorSection=Section("Monitor compartilhado",autoDisplays,monitorStatus,Button("Restaurar telas do Mac",async()=>{await runtime.Command("settings","restore","--peer",await runtime.Peer());}));
         content.Controls.Add(Row(Button("Reconectar",()=>{runtime.StartCore();return Task.FromResult(0);})));
     }
-    internal void Show(){panel.Show();panel.WindowState=FormWindowState.Normal;panel.Activate();if(!runtime.Preview)BeginRefresh();}
+    internal async void BeginBlockedExitFixture(){await Run(()=>runtime.Command());}
+    internal void CloseExitFixture(){panel.Close();}
+    internal void Show(){if(exiting)return;panel.Show();panel.WindowState=FormWindowState.Normal;panel.Activate();if(!runtime.Preview)BeginRefresh();}
     internal void Export(string path){panel.ShowInTaskbar=false;panel.StartPosition=FormStartPosition.Manual;panel.Location=new Point(-20000,-20000);panel.Show();Application.DoEvents();panel.PerformLayout();using(var image=new Bitmap(panel.Width,panel.Height)){panel.DrawToBitmap(image,new Rectangle(0,0,panel.Width,panel.Height));image.Save(path,System.Drawing.Imaging.ImageFormat.Png);}panel.Hide();}
     private async void BeginRefresh(){await Run(async()=>{await RefreshCameras();await storage.Refresh();await RefreshCards();});}
-    private async Task Run(Func<Task> action){if(busy)return;busy=true;feedback=null;ControlsState();try{await action();}catch(Exception e){feedback=e.Message;status.Text=e.Message;}finally{busy=false;if(!exiting&&!panel.IsDisposed)RefreshState();}}
+    private async Task Run(Func<Task> action){if(busy||exiting)return;busy=true;feedback=null;ControlsState();try{await action();}catch(Exception e){if(!exiting){feedback=e.Message;status.Text=e.Message;}}finally{busy=false;if(!exiting&&!panel.IsDisposed)RefreshState();}}
     private Dictionary<string,object> Options(){return runtime.Read(File.Exists(Path.Combine(runtime.Root,"peer-preferences.json"))?"peer-preferences.json":"preferences.json");}
     private void RefreshState(){
         var engine=runtime.Read("engine-status.json");var options=Options();bool fresh=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()-Json.Number(engine,"timestamp_ms")<6500;
@@ -105,7 +108,7 @@ internal sealed class Desk:ApplicationContext {
         storageStatus.Text=storage.Message;sdStart.Text=storage.Active?"Montar no destino":"Compartilhar cartão";ControlsState();
     }
     private void ControlsState(){bool free=!busy&&!runtime.Preview;input.Enabled=free;cameraOrigin.Enabled=free;cameras.Enabled=free;cameraStart.Enabled=free&&(Json.Get(Options(),"webcam_enabled")==null||Json.Flag(Options(),"webcam_enabled"));cameraStop.Enabled=free;cardOrigin.Enabled=free&&!storage.Active;cards.Enabled=free&&!storage.Active;sdStart.Enabled=free&&!storage.Pending&&(storage.Active||cards.SelectedItem is Choice);sdStop.Enabled=free&&storage.Active&&!storage.Pending;sdOpen.Enabled=free&&storage.Mounted;sdRefresh.Enabled=free&&!storage.Pending;}
-    private async void Tick(){RefreshState();ticks++;if(!runtime.Preview&&!busy&&!polling&&(panel.Visible||storage.Active)&&ticks%3==0){polling=true;try{await storage.Refresh();}catch(Exception e){storage.Message=e.Message;}finally{polling=false;RefreshState();}}}
+    private async void Tick(){if(exiting)return;RefreshState();ticks++;if(!runtime.Preview&&!busy&&!polling&&(panel.Visible||storage.Active)&&ticks%3==0){polling=true;try{await storage.Refresh();}catch(Exception e){storage.Message=e.Message;}finally{polling=false;if(!exiting)RefreshState();}}}
     private async Task RefreshCameras(){var result=cameraOrigin.SelectedIndex==0?await runtime.Command("webcam","list"):await runtime.Command("webcam","devices","--peer",await runtime.Peer());cameras.Items.Clear();foreach(var d in Json.Items(result,"devices")){string id=Json.Text(d,"id");if(id.Length>0)cameras.Items.Add(new Choice(id,Json.Text(d,"name","Webcam externa")));}if(cameras.Items.Count>0)cameras.SelectedIndex=0;}
     private async Task StartCamera(){if(Json.Get(Options(),"webcam_enabled") is bool&&!Json.Flag(Options(),"webcam_enabled"))throw new InvalidOperationException("Ative a webcam nos Ajustes.");var device=cameras.SelectedItem as Choice;if(device==null)throw new InvalidOperationException("Selecione uma webcam USB externa.");string peer=await runtime.Peer(),q=quality.SelectedIndex==1?"720p":"1080p";await runtime.StopCamera();await Task.Delay(1200);
         if(cameraOrigin.SelectedIndex==1){await runtime.Command("webcam","request","--peer",peer,"--device",device.Id,"--quality",q);return;}
@@ -114,10 +117,18 @@ internal sealed class Desk:ApplicationContext {
     private async Task RefreshCards(){if(storage.Active)return;var result=await runtime.Command(cardOrigin.SelectedIndex==1?new[]{"storage","list","--remote","--peer",await runtime.Peer()}:new[]{"storage","list"});cards.Items.Clear();foreach(var d in Json.Items(result,"volumes")){if(!Json.Flag(d,"removable"))continue;string id=Json.Text(d,"id");if(id.Length>0)cards.Items.Add(new Choice(id,Json.Text(d,"name","Cartão SD")+" · "+(Json.Number(d,"bytes")/1000000000).ToString("0.#")+" GB"));}if(cards.Items.Count>0)cards.SelectedIndex=0;}
     private async Task Patch(Dictionary<string,object> patch){await runtime.Command("settings","update","--patch",Json.Encode(patch),"--peer",await runtime.Peer());}
     private async Task OpenSettings(){var values=await runtime.Command("settings","show","--peer",await runtime.Peer());using(var form=new Settings(runtime,values)){form.ShowDialog(panel);}RefreshState();}
-    private void Menu(){var menu=tray.ContextMenuStrip;menu.Items.Clear();var label=menu.Items.Add(runtime.Paused?"Teclado e mouse em pausa":"Ponte Desk");label.Enabled=false;menu.Items.Add(new ToolStripSeparator());menu.Items.Add("Abrir Ponte Desk",null,(s,e)=>Show());menu.Items.Add(runtime.Paused?"Retomar teclado e mouse":"Pausar teclado e mouse",null,async(s,e)=>await Run(()=>runtime.Bridge(runtime.Paused)));menu.Items.Add("Ajustes…",null,async(s,e)=>{Show();await Run(OpenSettings);});menu.Items.Add("Parar webcam",null,async(s,e)=>await Run(()=>runtime.StopCamera()));menu.Items.Add(new ToolStripSeparator());menu.Items.Add("Encerrar Ponte Desk",null,async(s,e)=>await Quit());}
-    private async Task Quit(){if(busy||storage.Pending){Show();status.Text="Conclua a operação ou o pedido do sistema antes de encerrar.";return;}await Run(async()=>{if(storage.Active||Json.Flag(runtime.Read("storage-host.json"),"active")||Json.Flag(runtime.Read("storage-mount.json"),"active")){await storage.Refresh();await storage.Disconnect();}bool cameraFailed=false;try{await runtime.StopCamera();}catch{cameraFailed=true;}if(cameraFailed)await runtime.Command("webcam","stop-local");await runtime.StopCore();exiting=true;tray.Visible=false;panel.Close();ExitThread();});}
+    private void Menu(){var menu=tray.ContextMenuStrip;menu.Items.Clear();var label=menu.Items.Add(runtime.Paused?"Teclado e mouse em pausa":"Ponte Desk");label.Enabled=false;menu.Items.Add(new ToolStripSeparator());menu.Items.Add("Abrir Ponte Desk",null,(s,e)=>Show());menu.Items.Add(runtime.Paused?"Retomar teclado e mouse":"Pausar teclado e mouse",null,async(s,e)=>await Run(()=>runtime.Bridge(runtime.Paused)));menu.Items.Add("Ajustes…",null,async(s,e)=>{Show();await Run(OpenSettings);});menu.Items.Add("Parar webcam",null,async(s,e)=>await Run(()=>runtime.StopCamera()));menu.Items.Add("Recolher painel",null,(s,e)=>panel.Hide());menu.Items.Add(new ToolStripSeparator());menu.Items.Add("Encerrar Ponte Desk",null,async(s,e)=>await Quit());}
+    private async Task Quit(){
+        if(exiting)return;exiting=true;timer.Stop();tray.Visible=false;panel.Hide();
+        // Even a blocked OS credential dialog or an unavailable peer cannot
+        // veto an explicit quit. This deadline belongs only to this process.
+        exitDeadline=new System.Threading.Timer(s=>Environment.Exit(0),null,2000,Timeout.Infinite);
+        try{if(!runtime.Preview)await runtime.ExitNow();}
+        finally{panel.Close();ExitThread();}
+    }
+
     private void ThemeChanged(object sender,UserPreferenceChangedEventArgs e){if(panel.IsHandleCreated)panel.BeginInvoke((Action)(()=>{iconPaused=null;ApplyTheme(panel);Artwork.Chrome(panel);RefreshState();}));}
     private void ApplyTheme(Control c){c.ForeColor=Artwork.Text;c.BackColor=c==panel||c==content?Artwork.Background:Artwork.Surface;foreach(Control child in c.Controls)ApplyTheme(child);}
-    protected override void Dispose(bool disposing){if(disposing){timer.Stop();timer.Dispose();activation.Unregister(null);SystemEvents.UserPreferenceChanged-=ThemeChanged;tray.Visible=false;tray.Dispose();if(icon!=null)icon.Dispose();panel.Dispose();}base.Dispose(disposing);}
+    protected override void Dispose(bool disposing){if(disposing){if(exitDeadline!=null)exitDeadline.Dispose();timer.Stop();timer.Dispose();activation.Unregister(null);SystemEvents.UserPreferenceChanged-=ThemeChanged;tray.Visible=false;tray.Dispose();if(icon!=null)icon.Dispose();panel.Dispose();}base.Dispose(disposing);}
 }
 }

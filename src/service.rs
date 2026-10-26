@@ -175,6 +175,7 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        crate::storage::shutdown();
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
