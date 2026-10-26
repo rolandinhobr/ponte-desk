@@ -11,3 +11,5 @@ A câmera usa TLS 1.3 com certificado pareado fixado e prova HMAC por desafio. O
 A extensão CMIO é um componente de sistema instalado uma vez. O host original assinado é necessário para ativação, mas fica encerrado durante uso. O produtor escreve diretamente no sink público. [Componente](camera-component.md).
 
 O estado desejado de política, o estado nativo dos hooks e a conexão DTLS são evidências distintas. Um status de captura ativa não prova que os comandos estejam chegando ao outro computador. O probe pareado verifica o transporte sem injetar entrada.
+
+O módulo de armazenamento controla sessões explícitas de SMB nativo. A listagem e os comandos administrativos ficam fora do pipeline de entrada. O Mac usa Disk Arbitration, NetFS e um auxiliar XPC acionado por SMAppService; o Windows usa Win32 para identificar mídia removível, mapear unidades e manter uma sessão administrativa com IPC local autenticado pelo PID. O tráfego dos arquivos fica no SMB do sistema, com criptografia e acesso somente leitura no compartilhamento. Nenhuma senha SMB passa pelo protocolo do Ponte Desk.

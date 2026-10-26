@@ -1,4 +1,4 @@
-param([string]$SourceRoot=$PSScriptRoot,[string]$DeveloperCommand='')
+param([string]$SourceRoot=$PSScriptRoot,[string]$DeveloperCommand='', [switch]$PrepareOnly)
 $ErrorActionPreference='Stop'
 if($env:VSCMD_ARG_TGT_ARCH -ne 'x64' -or !(Get-Command cl.exe -ErrorAction SilentlyContinue)){
  if(!$DeveloperCommand){
@@ -30,6 +30,7 @@ foreach($package in @(@('microsoft.windows.cppwinrt','3.0.260818.1'),@('microsof
   Get-FileHash $zip -Algorithm SHA256|Select-Object Hash,Path|ConvertTo-Json -Compress
  }
 }
+if($PrepareOnly){return}
 $out=Join-Path $SourceRoot 'build';New-Item -Type Directory -Force $out|Out-Null
 $src=Join-Path $SourceRoot 'source'
 $wil=Join-Path $deps 'microsoft.windows.implementationlibrary.1.0.260126.7\include'

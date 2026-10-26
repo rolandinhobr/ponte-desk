@@ -38,6 +38,14 @@ enum LanMouseError {
 }
 
 fn main() {
+    // The short-lived elevated storage helper must never write user-selected
+    // log paths with administrator privileges.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("storage")
+        && std::env::args().nth(2).as_deref() == Some("elevated-host")
+    {
+        process::exit(lan_mouse::storage::dispatch().unwrap_or(1));
+    }
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
     #[cfg(not(windows))]
@@ -79,6 +87,9 @@ fn windows_log_target() -> env_logger::Target {
 
 fn run() -> Result<(), LanMouseError> {
     if let Some(code) = lan_mouse::preferences::dispatch() {
+        process::exit(code);
+    }
+    if let Some(code) = lan_mouse::storage::dispatch() {
         process::exit(code);
     }
     if let Some(code) = lan_mouse::webcam::dispatch() {

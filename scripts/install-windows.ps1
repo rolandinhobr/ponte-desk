@@ -28,6 +28,10 @@ if(Test-Path $cameraDll){& (Join-Path $PSScriptRoot '..\native\windows\webcam\in
 if(!(Get-NetFirewallRule -DisplayName 'Ponte Desk Webcam - rede pareada' -ErrorAction SilentlyContinue)) {
  New-NetFirewallRule -DisplayName 'Ponte Desk Webcam - rede pareada' -Direction Inbound -Action Allow -Program $exe -Protocol TCP -LocalPort 4244 -RemoteAddress $cfg.peers -Profile Any | Out-Null
 }
+
+$storageDll=Join-Path $PSScriptRoot '..\dist\windows\storage\PonteDeskStorage.dll'
+if(Test-Path $storageDll){& (Join-Path $PSScriptRoot '..\native\windows\storage\install.ps1') -Dll $storageDll}
+
 $daemonPid=& (Join-Path $PSScriptRoot 'start-windows-standard.ps1') -Exe $exe
 if([PonteDeskStandardBootstrap]::Elevated([uint32]$daemonPid)) {
  Stop-Process -Id $daemonPid -Force -ErrorAction SilentlyContinue

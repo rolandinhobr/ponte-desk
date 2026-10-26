@@ -8,7 +8,11 @@ stage=$(mktemp -d "${TMPDIR:-/tmp}/ponte-desk-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT INT TERM
 app="$stage/Ponte Desk.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Helpers"
-swiftc -emit-library -O -module-name PonteDeskUI "$project_dir/native/macos/PonteDesk.swift" "$project_dir/native/macos/PonteInterface.swift" "$project_dir/native/macos/PonteArtwork.swift" "$project_dir/native/macos/PonteSettings.swift" "$project_dir/native/macos/CameraComponent.swift" "$project_dir/native/macos/WebcamCapture.swift" "$project_dir/native/macos/WebcamSink.swift" -o "$app/Contents/Frameworks/PonteDeskUI.dylib" -framework AppKit -framework ApplicationServices -framework AVFoundation -framework VideoToolbox -framework CoreMediaIO -framework CoreMedia -framework CoreVideo -framework ImageIO
+swiftc -emit-library -O -module-name PonteDeskUI "$project_dir/native/macos/PonteDesk.swift" "$project_dir/native/macos/PonteInterface.swift" "$project_dir/native/macos/PonteArtwork.swift" "$project_dir/native/macos/PonteSettings.swift" "$project_dir/native/macos/PonteStorage.swift" "$project_dir/native/macos/StorageNative.swift" "$project_dir/native/macos/storage/StorageProtocol.swift" "$project_dir/native/macos/storage/StorageVolumes.swift" "$project_dir/native/macos/CameraComponent.swift" "$project_dir/native/macos/WebcamCapture.swift" "$project_dir/native/macos/WebcamSink.swift" -o "$app/Contents/Frameworks/PonteDeskUI.dylib" -framework AppKit -framework ApplicationServices -framework AVFoundation -framework VideoToolbox -framework CoreMediaIO -framework CoreMedia -framework CoreVideo -framework ImageIO -framework DiskArbitration -framework NetFS -framework Security -framework ServiceManagement
+mkdir -p "$app/Contents/Library/LaunchDaemons"
+swiftc -O -parse-as-library "$project_dir/native/macos/storage/StorageProtocol.swift" "$project_dir/native/macos/storage/StorageVolumes.swift" "$project_dir/native/macos/storage/StorageHelper.swift" -o "$app/Contents/MacOS/ponte-storage-helper" -framework DiskArbitration -framework Security
+codesign --force --sign - --identifier br.com.ponte-desk.storage-helper "$app/Contents/MacOS/ponte-storage-helper"
+cp "$project_dir/native/macos/storage/br.com.ponte-desk.storage-helper.plist" "$app/Contents/Library/LaunchDaemons/"
 cp "$target_dir/release/ponte-desk" "$app/Contents/MacOS/ponte-desk"
 cp "$project_dir/native/macos/Info.plist" "$app/Contents/Info.plist"
 mkdir -p "$app/Contents/Resources"

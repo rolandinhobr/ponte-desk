@@ -824,6 +824,7 @@ fn receive_command(
     let request: serde_json::Value = serde_json::from_slice(&data)?;
     let result = (|| -> Result<serde_json::Value, String> {
         match request["op"].as_str() {
+            Some(op) if op.starts_with("storage.") => crate::storage::rpc(peer, op, &request),
             Some("monitors") => Ok(crate::integration::monitor_catalog()),
             Some("layout") => {
                 crate::preferences::set_layout(request["position"].as_str().unwrap_or(""))

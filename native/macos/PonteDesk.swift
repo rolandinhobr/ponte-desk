@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var monitorGroup:NSView?;var monitorStatus:NSTextField?;var autoDisplaySwitch:NSSwitch?;var layoutLabel:NSTextField?
     var settingsController:PonteSettingsController?
     var preparingCamera=false
+    lazy var storage = PonteStorageController(owner:self)
     @objc func showSettings(){if settingsController?.window?.isVisible != true{settingsController=PonteSettingsController(owner:self)};settingsController?.showWindow(nil);NSApp.activate(ignoringOtherApps:true)}
     @objc func cameraOriginChanged(){
         let remote=cameraOrigin?.selectedSegment==1;cameraLocal?.isHidden=remote;cameraRemote?.isHidden = !remote
@@ -121,7 +122,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         signal(SIGTERM, SIG_IGN)
         let source=DispatchSource.makeSignalSource(signal:SIGTERM,queue:.main)
-        source.setEventHandler { NSApp.terminate(nil) }; source.resume(); terminationSource=source
+        source.setEventHandler {
+            // AppKit's asynchronous termination pumps a nested run loop.
+            // Enter it outside a GCD main-queue handler so completion blocks
+            // can still drain instead of deadlocking a SIGTERM update.
+            RunLoop.main.perform(inModes:[.default,.modalPanel,.eventTracking]) {NSApp.terminate(nil)}
+        }; source.resume(); terminationSource=source
         item = NSStatusBar.system.statusItem(withLength: 26)
         item.button?.image = PonteArtwork.menuIcon()
         item.button?.imagePosition = .imageOnly
@@ -129,11 +135,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.toolTip = "Ponte Desk — seus computadores, juntos"
         let menu = NSMenu(); menu.delegate = self; item.menu = menu
         if !preview {startObserver()}
+        storage.refreshAll()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             if let self=self, !self.preview, self.observer?.isRunning != true, Date().timeIntervalSince(self.lastStart)>10 {self.startObserver()}
             if self?.preview != true {self?.updateDisplay();self?.finishCameraSetupIfReady()}
             if self?.panel?.isVisible == true { self?.refreshPanel();self?.refreshCameraStatus() }
+            self?.storage.tick()
         }
+        if let timer {RunLoop.main.add(timer,forMode:.modalPanel)}
         if !CommandLine.arguments.contains("--background") { showPanel() }
     }
 
@@ -186,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func showPanel(){
         if panel==nil{panel=buildPontePanel(self);cameraOrigin?.selectedSegment=UserDefaults.standard.integer(forKey:"webcamOrigin");cameraOriginChanged();refreshCameras()}
         refreshPanel();panel?.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
+        storage.refreshAll()
     }
     func refreshPanel(){
         statusText?.stringValue=mode();item?.button?.image=PonteArtwork.menuIcon(paused:paused)
@@ -292,8 +302,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleDisplays(){var values=options;values["manage_displays"]=autoDisplaySwitch?.state == .on;saveOptions(values,position:peerPosition){[weak self] error in if let error{self?.monitorStatus?.stringValue=error}}}
     @objc func restoreDisplays(){guard !preview else{return};var values=options;values["manage_displays"]=false;saveOptions(values,position:peerPosition){_ in};displays.lastEnable=nil;displays.update(enable:true,root:root)}
     @objc func quit() { NSApp.terminate(nil) }
+    func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+        if preview{return .terminateNow}
+        storage.prepareToQuit { [weak self] ready in
+            DispatchQueue.main.async {
+                if !ready {self?.showPanel()}
+                sender.reply(toApplicationShouldTerminate:ready)
+            }
+        }
+        return .terminateLater
+    }
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        storage.invalidate()
         if let cameraProcess=cameraProcess,cameraProcess.isRunning{cameraProcess.interrupt()}
         if let observer=observer, observer.isRunning { kill(observer.processIdentifier, SIGINT) }
     }
