@@ -219,6 +219,9 @@ fn stop_host(session: &str, peer: Option<&str>) -> Result<Value, String> {
     Ok(json!({"ok":true,"phase":"stopping"}))
 }
 fn parent_alive(pid: u32) -> bool {
+    if pid < 2 {
+        return false;
+    }
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -439,6 +442,11 @@ pub fn dispatch() -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_controller_pids_are_not_process_groups() {
+        assert!(!parent_alive(0));
+        assert!(!parent_alive(1));
+    }
     #[test]
     fn exact_owned_namespace() {
         let s = "0123456789abcdef0123456789abcdef";
