@@ -158,6 +158,9 @@ impl Guard {
             "capture_installed": capture, "emulation_enabled": emulation, "direct_active": self.direct_active,
             "reason": self.policy.reason,
             "ignored_software_events": ignored,
+            "native_input": input_emulation::native_performance().map(|p| serde_json::json!({
+                "requests":p.requests,"max_native_us":p.max_native_us,"max_round_trip_us":p.max_round_trip_us
+            })),
         });
         {
             let parent = root;

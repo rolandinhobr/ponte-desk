@@ -25,6 +25,26 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_worker;
+
+/// Aggregate timings only; never includes input contents or cursor coordinates.
+pub struct NativePerformance {
+    pub requests: u64,
+    pub max_native_us: u64,
+    pub max_round_trip_us: u64,
+}
+
+pub fn native_performance() -> Option<NativePerformance> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(macos_worker::performance())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
 
 /// fallback input emulation (logs events)
 mod dummy;
@@ -90,7 +110,7 @@ impl InputEmulation {
             #[cfg(windows)]
             Backend::Windows => Box::new(windows::WindowsEmulation::new()?),
             #[cfg(target_os = "macos")]
-            Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
+            Backend::MacOs => Box::new(macos_worker::MacOSInputWorker::new().await?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
         Ok(Self {

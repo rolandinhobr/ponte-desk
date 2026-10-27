@@ -144,6 +144,8 @@ pub enum X11EmulationCreationError {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Error)]
 pub enum MacOSEmulationCreationError {
+    #[error("input worker: `{0}`")]
+    Worker(#[from] io::Error),
     #[error("could not create event source")]
     EventSourceCreation,
     #[error("accessibility permission is required")]
