@@ -2,7 +2,13 @@
 //! Never sends Enter, Leave, mouse or keyboard input and never changes pairing.
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     net::UdpSocket,
     time::{sleep, timeout},
@@ -19,9 +25,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(
         args.next()
-            .ok_or("usage: kvm_link_probe CONFIG_DIR PEER_IP:4242")?,
+            .ok_or("usage: kvm_link_probe CONFIG_DIR PEER_IP:4242 [COUNT]")?,
     );
     let addr: SocketAddr = args.next().ok_or("missing peer address")?.parse()?;
+    let count: usize = args
+        .next()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(5);
+    if !(1..=240).contains(&count) {
+        return Err("COUNT must be between 1 and 240".into());
+    }
     let config: toml::Value = toml::from_str(&std::fs::read_to_string(root.join("config.toml"))?)?;
     let pins: HashSet<String> = config
         .get("authorized_fingerprints")
@@ -63,23 +77,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (packet, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
     let mut pongs = 0;
     let mut available = false;
-    for _ in 0..5 {
+    let mut round_trips = Vec::with_capacity(count);
+    for _ in 0..count {
+        let sent = Instant::now();
         conn.send(&packet[..len]).await?;
         let mut buf = [0; MAX_EVENT_SIZE];
         timeout(Duration::from_secs(3), conn.recv(&mut buf)).await??;
         if let Ok(ProtoEvent::Pong(enabled)) = buf.try_into() {
+            round_trips.push(sent.elapsed().as_secs_f64() * 1000.);
             pongs += 1;
             available = enabled;
         } else {
             return Err("unexpected response to Ping".into());
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(250)).await;
     }
     let _ = timeout(Duration::from_secs(1), conn.close()).await;
+    round_trips.sort_by(f64::total_cmp);
+    let mean = round_trips.iter().sum::<f64>() / round_trips.len() as f64;
+    let percentile = |p: f64| round_trips[((round_trips.len() - 1) as f64 * p).ceil() as usize];
     println!(
         "{}",
         serde_json::json!({"paired_certificate_verified":true,"dtls_handshake":true,
-        "ping_pong_round_trips":pongs,"remote_emulation_available":available,"input_sent":false})
+        "ping_pong_round_trips":pongs,"rtt_mean_ms":mean,
+        "rtt_p50_ms":percentile(0.5),"rtt_p95_ms":percentile(0.95),
+        "rtt_max_ms":round_trips.last(),"rtt_samples_ms":round_trips,"remote_emulation_available":available,"input_sent":false})
     );
     Ok(())
 }
