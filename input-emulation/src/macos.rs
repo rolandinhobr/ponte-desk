@@ -18,9 +18,8 @@ use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
 
@@ -43,8 +42,8 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
-    /// notify to cancel key repeats
-    notify_repeat_task: Arc<Notify>,
+    /// Persistent cancellation for this key only, including before first poll.
+    repeat_cancel: Option<oneshot::Sender<()>>,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -84,7 +83,7 @@ impl MacOSEmulation {
             previous_button_click: None,
             button_click_state: 0,
             repeat_task: None,
-            notify_repeat_task: Arc::new(Notify::new()),
+            repeat_cancel: None,
             modifier_state: Rc::new(Cell::new(XMods::empty())),
         })
     }
@@ -102,46 +101,52 @@ impl MacOSEmulation {
         key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
         // repeat task
         let event_source = self.event_source.clone();
-        let notify = self.notify_repeat_task.clone();
+        let (cancel, cancelled) = oneshot::channel();
+        self.repeat_cancel = Some(cancel);
         let modifiers = self.modifier_state.clone();
-        let repeat_task = tokio::task::spawn_local(async move {
-            let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
-                _ = notify.notified() => true,
-            };
-            if !stop {
-                loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
-                    tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
-                        _ = notify.notified() => break,
-                    }
-                }
-            }
-            // Always release the key with the correct CGKeyCode, regardless of
-            // whether the repeat loop ran. This matches @feschber's review
-            // request: "still release the key repeat task but with the correct
-            // code."
-            //
-            // Do NOT call update_modifiers here: `key` is a Mac CGKeyCode but
-            // update_modifiers expects a Linux evdev scancode, and the two
-            // codespaces collide (e.g. Mac LeftShift=56 == Linux KeyLeftAlt=56,
-            // Mac Down=125 == Linux KeyLeftMeta=125), corrupting modifier
-            // state for chords like Shift+Option+X or Cmd+Down. Modifier state
-            // is owned by the main consume() loop, which already calls
-            // update_modifiers with the correct Linux scancode on the real key
-            // release event from the client.
-            key_event(event_source.clone(), key, 0, modifiers.get());
-        });
+        let repeat_task = tokio::task::spawn_local(repeat_key_events(
+            cancelled,
+            DEFAULT_REPEAT_DELAY,
+            DEFAULT_REPEAT_INTERVAL,
+            move |state| {
+                key_event(event_source.clone(), key, state, modifiers.get());
+            },
+        ));
         self.repeat_task = Some(repeat_task);
     }
 
     async fn cancel_repeat_task(&mut self) {
+        if let Some(cancel) = self.repeat_cancel.take() {
+            let _ = cancel.send(());
+        }
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
             let _ = task.await;
         }
     }
+}
+
+// Run the repeat loop separately so cancellation timing can be tested without
+// creating or posting any native input events.
+async fn repeat_key_events(
+    mut cancelled: oneshot::Receiver<()>,
+    delay: Duration,
+    interval: Duration,
+    mut emit: impl FnMut(u8),
+) {
+    let mut wait = delay;
+    loop {
+        tokio::select! {
+            // A release already sent must win even if the timer is also ready.
+            biased;
+            _ = &mut cancelled => break,
+            _ = tokio::time::sleep(wait) => emit(1),
+        }
+        wait = interval;
+    }
+    // Preserve the unconditional key-up requested in @feschber's review.
+    // The captured code is a Mac CGKeyCode: never translate it as a Linux
+    // scancode or change modifiers here; the real key release owns that state.
+    emit(0);
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
@@ -537,7 +542,9 @@ impl Emulation for MacOSEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
+    }
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -678,5 +685,106 @@ mod scroll_direction_tests {
     fn invalid_axis_is_rejected_and_extreme_delta_does_not_overflow() {
         assert_eq!(quartz_scroll_wheels(2, 120), None);
         assert_eq!(quartz_scroll_wheels(0, i32::MIN), Some((1, i32::MAX, 0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod repeat_cancellation_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[tokio::test]
+    async fn repeat_cancellation_before_first_poll_never_hangs() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (cancel, cancelled) = oneshot::channel();
+                let states = Rc::new(RefCell::new(Vec::new()));
+                let recorded = states.clone();
+                let task = tokio::task::spawn_local(repeat_key_events(
+                    cancelled,
+                    DEFAULT_REPEAT_DELAY,
+                    DEFAULT_REPEAT_INTERVAL,
+                    move |state| {
+                        recorded.borrow_mut().push(state);
+                    },
+                ));
+                // Reproduces the fast down/up race before the repeat task runs.
+                cancel.send(()).unwrap();
+                let completed = tokio::time::timeout(Duration::from_millis(100), task).await;
+                assert!(
+                    completed.is_ok(),
+                    "key release lost its cancellation signal"
+                );
+                assert_eq!(&*states.borrow(), &[0]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn active_repeat_cancels_and_releases_exactly_once() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (cancel, cancelled) = oneshot::channel();
+                let (began, started) = oneshot::channel();
+                let mut began = Some(began);
+                let states = Rc::new(RefCell::new(Vec::new()));
+                let recorded = states.clone();
+                let task = tokio::task::spawn_local(repeat_key_events(
+                    cancelled,
+                    Duration::ZERO,
+                    Duration::from_secs(60),
+                    move |state| {
+                        recorded.borrow_mut().push(state);
+                        if state == 1 {
+                            if let Some(began) = began.take() {
+                                let _ = began.send(());
+                            }
+                        }
+                    },
+                ));
+                tokio::time::timeout(Duration::from_secs(2), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                cancel.send(()).unwrap();
+                tokio::time::timeout(Duration::from_millis(100), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&*states.borrow(), &[1, 0]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fast_key_pairs_do_not_share_or_lose_cancellation() {
+        for _ in 0..1000 {
+            let (cancel, cancelled) = oneshot::channel();
+            let mut states = Vec::new();
+            cancel.send(()).unwrap();
+            repeat_key_events(
+                cancelled,
+                DEFAULT_REPEAT_DELAY,
+                DEFAULT_REPEAT_INTERVAL,
+                |state| states.push(state),
+            )
+            .await;
+            assert_eq!(states, vec![0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_cancellation_owner_still_releases_key() {
+        let (cancel, cancelled) = oneshot::channel();
+        drop(cancel);
+        let mut states = Vec::new();
+        repeat_key_events(
+            cancelled,
+            DEFAULT_REPEAT_DELAY,
+            DEFAULT_REPEAT_INTERVAL,
+            |state| states.push(state),
+        )
+        .await;
+        assert_eq!(states, vec![0]);
     }
 }
