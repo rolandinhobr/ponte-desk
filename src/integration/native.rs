@@ -303,6 +303,8 @@ pub struct Coordinator {
     peer_seen: Instant,
     learned: Option<SocketAddr>,
     last_probe: Instant,
+    platform_probe: super::probe::BackgroundProbe<PlatformState>,
+    platform_ready: bool,
     last_send: Instant,
     last_status: Instant,
     candidate: Policy,
@@ -336,6 +338,8 @@ impl Coordinator {
             peer_seen: old,
             learned: None,
             last_probe: old,
+            platform_probe: super::probe::BackgroundProbe::new(super::platform_probe)?,
+            platform_ready: false,
             last_send: old,
             last_status: old,
             candidate: Policy::local("iniciando"),
@@ -372,19 +376,38 @@ impl Coordinator {
             {
                 self.local.preferences = Some(crate::preferences::Preferences::load(&self.root));
             }
-            self.local.platform = super::platform_probe();
+            // Fixed peripherals do not depend on displays or foreground apps.
+            // In edge mode an OS query runs on its own bounded worker instead
+            // of stopping network reception and native input on this executor.
+            if self
+                .local
+                .preferences
+                .as_ref()
+                .is_some_and(|p| p.input_mode != "edges")
+            {
+                self.local.platform = PlatformState::default();
+                self.platform_ready = true;
+            } else {
+                let sample = self.platform_probe.poll(Duration::from_secs(2));
+                self.platform_ready = sample.is_some();
+                self.local.platform = sample.unwrap_or_default();
+            }
             self.last_probe = Instant::now();
         }
         self.local.agent = lease_active(&self.root);
         self.local.manual_pause = self.root.join("manual-pause").exists()
             || !crate::preferences::Preferences::valid_file(&self.root);
-        let candidate = choose_policy(
-            &self.config.side,
-            &self.local,
-            self.peer.as_ref(),
-            self.peer_seen.elapsed(),
-            &self.config,
-        );
+        let candidate = if !self.platform_ready {
+            Policy::local("metadados do sistema indisponíveis: controle local")
+        } else {
+            choose_policy(
+                &self.config.side,
+                &self.local,
+                self.peer.as_ref(),
+                self.peer_seen.elapsed(),
+                &self.config,
+            )
+        };
         if candidate.capture != self.candidate.capture
             || candidate.emulation != self.candidate.emulation
             || candidate.reason != self.candidate.reason

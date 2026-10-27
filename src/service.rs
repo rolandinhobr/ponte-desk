@@ -140,6 +140,8 @@ impl Service {
         let _webcam_receiver = crate::webcam::start_receiver();
         let mut guard_tick = tokio::time::interval(std::time::Duration::from_millis(250));
         guard_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_guard = std::time::Instant::now();
+        let mut last_delay_warning = last_guard - std::time::Duration::from_secs(10);
         let active = self.client_manager.active_clients();
         for handle in active.iter() {
             // small hack: `activate_client()` checks, if the client
@@ -155,6 +157,14 @@ impl Service {
         loop {
             tokio::select! {
                 _ = guard_tick.tick() => {
+                    let started = std::time::Instant::now();
+                    let gap = started.duration_since(last_guard);
+                    if gap > std::time::Duration::from_millis(750)
+                        && last_delay_warning.elapsed() >= std::time::Duration::from_secs(10) {
+                        log::warn!("input executor scheduling gap: {} ms", gap.as_millis());
+                        last_delay_warning = started;
+                    }
+                    last_guard = started;
                     let stop = crate::integration::preferences_root().join(format!("engine-stop-{}",std::process::id()));
                     if stop.exists() { let _=std::fs::remove_file(stop); break; }
                     let changed = self.integration.refresh();
@@ -165,6 +175,9 @@ impl Service {
                         self.emulation.suspend(!self.integration.policy.emulation);
                     }
                     self.integration.write_status(self.capture_status.into(), self.emulation_status.into(), changed);
+                    if started.elapsed() > std::time::Duration::from_millis(100) {
+                        log::warn!("input coordinator took {} ms", started.elapsed().as_millis());
+                    }
                 },
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,

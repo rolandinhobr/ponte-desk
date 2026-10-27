@@ -5,6 +5,7 @@ pub mod agent;
 #[cfg(target_os = "macos")]
 mod macos;
 mod native;
+mod probe;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

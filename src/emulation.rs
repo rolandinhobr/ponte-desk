@@ -1,8 +1,8 @@
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
-use input_event::Event;
+use input_event::{Event, PointerEvent};
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -248,6 +248,7 @@ pub(crate) struct EmulationProxy {
     task: JoinHandle<()>,
 }
 
+#[derive(Debug, PartialEq)]
 enum ProxyRequest {
     Input(Event, SocketAddr),
     Remove(SocketAddr),
@@ -415,9 +416,10 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
+        let mut pending = None;
         loop {
             tokio::select! {
-                e = self.request_rx.recv() => match e.expect("channel closed") {
+                e = receive_input_batch(&mut self.request_rx, &mut pending) => match e {
                     ProxyRequest::Input(event, addr) => {
                         let handle = match self.handles.get(&addr) {
                             Some(&handle) => handle,
@@ -447,6 +449,60 @@ impl EmulationTask {
             }
         }
     }
+}
+
+// Drain only input already queued: no timer and no added latency at normal rates.
+// Keep boundaries (keys, buttons, wheel, control, peer, direction) in exact order.
+async fn receive_input_batch(
+    rx: &mut Receiver<ProxyRequest>,
+    pending: &mut Option<ProxyRequest>,
+) -> ProxyRequest {
+    let mut first = match pending.take() {
+        Some(value) => value,
+        None => rx.recv().await.expect("channel closed"),
+    };
+    if !matches!(
+        first,
+        ProxyRequest::Input(Event::Pointer(PointerEvent::Motion { .. }), _)
+    ) {
+        return first;
+    }
+    // Bound work per turn so the coordinator and disconnect handling stay fair.
+    for _ in 1..64 {
+        let Some(Some(next)) = rx.recv().now_or_never() else {
+            break;
+        };
+        let merged = match (&mut first, &next) {
+            (
+                ProxyRequest::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy }), addr),
+                ProxyRequest::Input(
+                    Event::Pointer(PointerEvent::Motion {
+                        time: nt,
+                        dx: nx,
+                        dy: ny,
+                    }),
+                    na,
+                ),
+            ) if addr == na
+                && nt.wrapping_sub(*time) <= 8
+                && *dx * nx >= 0.
+                && *dy * ny >= 0.
+                && (*dx + nx).is_finite()
+                && (*dy + ny).is_finite() =>
+            {
+                *time = *nt;
+                *dx += nx;
+                *dy += ny;
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            *pending = Some(next);
+            break;
+        }
+    }
+    first
 }
 
 fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
@@ -488,5 +544,107 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    use input_event::KeyboardEvent;
+
+    fn motion(time: u32, dx: f64, addr: SocketAddr) -> ProxyRequest {
+        ProxyRequest::Input(
+            Event::Pointer(PointerEvent::Motion { time, dx, dy: 0. }),
+            addr,
+        )
+    }
+
+    #[tokio::test]
+    async fn mouse_backlog_preserves_displacement_and_key_release_order() {
+        let addr = "127.0.0.1:4242".parse().unwrap();
+        let (tx, mut rx) = channel();
+        let key = |state| {
+            ProxyRequest::Input(
+                Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: 30,
+                    state,
+                }),
+                addr,
+            )
+        };
+        tx.send(key(1)).unwrap();
+        for time in 0..2000 {
+            tx.send(motion(time, 1., addr)).unwrap();
+        }
+        tx.send(key(0)).unwrap();
+        tx.send(ProxyRequest::Suspend(true)).unwrap();
+        let mut pending = None;
+        assert_eq!(receive_input_batch(&mut rx, &mut pending).await, key(1));
+        let mut total = 0.;
+        let mut native_calls = 0;
+        loop {
+            match receive_input_batch(&mut rx, &mut pending).await {
+                ProxyRequest::Input(Event::Pointer(PointerEvent::Motion { dx, .. }), _) => {
+                    total += dx;
+                    native_calls += 1;
+                }
+                event => {
+                    assert_eq!(event, key(0));
+                    break;
+                }
+            }
+        }
+        assert_eq!(total, 2000.);
+        assert!(native_calls <= 32, "native calls: {native_calls}");
+        assert_eq!(
+            receive_input_batch(&mut rx, &mut pending).await,
+            ProxyRequest::Suspend(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn coalescing_preserves_peer_direction_buttons_wheel_and_control_boundaries() {
+        let a = "127.0.0.1:4242".parse().unwrap();
+        let b = "127.0.0.2:4242".parse().unwrap();
+        let events = [
+            motion(0, 1., a),
+            motion(1, -1., a),
+            motion(2, -1., b),
+            ProxyRequest::Input(
+                Event::Pointer(PointerEvent::Button {
+                    time: 3,
+                    button: 272,
+                    state: 1,
+                }),
+                b,
+            ),
+            motion(4, -1., b),
+            ProxyRequest::Input(
+                Event::Pointer(PointerEvent::AxisDiscrete120 {
+                    axis: 0,
+                    value: 120,
+                }),
+                b,
+            ),
+            motion(5, -1., b),
+            ProxyRequest::Remove(b),
+            ProxyRequest::Terminate,
+        ];
+        let (tx, mut rx) = channel();
+        for event in &events {
+            // Events are Copy; control requests are reconstructed for this fixture.
+            let copy = match event {
+                ProxyRequest::Input(e, addr) => ProxyRequest::Input(*e, *addr),
+                ProxyRequest::Remove(addr) => ProxyRequest::Remove(*addr),
+                ProxyRequest::Terminate => ProxyRequest::Terminate,
+                _ => unreachable!(),
+            };
+            tx.send(copy).unwrap();
+        }
+        let mut pending = None;
+        for expected in events {
+            assert_eq!(receive_input_batch(&mut rx, &mut pending).await, expected);
+        }
     }
 }
