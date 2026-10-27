@@ -25,8 +25,6 @@ mod libei;
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "macos")]
-mod macos_displays;
 
 /// fallback input emulation (logs events)
 mod dummy;
