@@ -342,11 +342,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func quit() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
         // Quitting is an unconditional user command. Storage/network health
-        // must never veto or defer it, including Cmd+Q and the window close.
+        // must never veto or defer it, including Cmd+Q and the menu command.
         .terminateNow
     }
     func windowShouldClose(_ sender:NSWindow)->Bool {
-        if sender === panel {quit();return false}
+        if sender === panel {hidePanel();return false}
         return true
     }
     func applicationWillTerminate(_ notification: Notification) {

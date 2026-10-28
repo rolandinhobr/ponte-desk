@@ -21,7 +21,7 @@ O modo padrão usa **telas independentes**. Não exige monitor específico, DDC 
 
 ## Como funciona
 
-O painel fica na barra de menus do Mac e na bandeja do Windows, com o mesmo símbolo e os mesmos recursos. Os dois aplicativos permitem pausar/retomar teclado e mouse, controlar webcam e cartão SD, e editar os ajustes compartilhados. Fechar a janela ou escolher Encerrar Ponte Desk encerra o aplicativo, mesmo com uma operação pendente. Use Recolher painel no menu para mantê-lo na barra. Sem conta, nuvem, NAS ou assinatura, e sem precisar manter outro aplicativo aberto. A webcam física só é capturada após o início manual do compartilhamento.
+O painel fica na barra de menus do Mac e na bandeja do Windows, com o mesmo símbolo e os mesmos recursos. Os dois aplicativos permitem pausar/retomar teclado e mouse, controlar webcam e cartão SD, e editar os ajustes compartilhados. No Mac, o X vermelho recolhe a janela e mantém a ponte ativa na barra de menus; clique em Abrir Ponte Desk para voltar ao painel. Encerrar Ponte Desk ou ⌘Q encerra o aplicativo, mesmo com uma operação pendente. No Windows, fechar a janela encerra o aplicativo; Recolher painel mantém o app na bandeja. Sem conta, nuvem, NAS ou assinatura, e sem precisar manter outro aplicativo aberto. A webcam física só é capturada após o início manual do compartilhamento.
 
 No aplicativo de chamada, escolha **Ponte Desk Camera**. No Mac, o componente assinado publica uma saída 1080p; a opção 720p reduz captura e rede, e o receptor adapta a imagem. O microfone continua sendo o escolhido localmente no aplicativo de chamada.
 

@@ -31,9 +31,21 @@ private final class ExitFixture:NSObject,NSApplicationDelegate {
             let window=NSWindow(contentRect:NSRect(x:-20000,y:-20000,width:100,height:100),styleMask:[.titled,.closable],backing:.buffered,defer:false)
             self.owner.panel=window;window.delegate=self.owner
             self.began=Date()
-            // The normal close-button route, without showing or clicking a
-            // desktop window. It must reach terminateNow despite pending work.
+            // Exercise the red button offscreen, without moving desktop input.
+            // Closing hides the panel and must leave all pending work alive.
+            window.orderFront(nil)
+            check(window.isVisible,"Fixture window was not visible")
             window.performClose(nil)
+            check(!window.isVisible,"Window close did not hide the panel")
+            check(self.owner.panel === window,"Window close discarded the panel")
+            check(self.owner.observer?.isRunning == true,"Window close stopped the engine")
+            check(self.owner.cameraProcess?.isRunning == true,"Window close stopped the camera")
+            check((try? Data(contentsOf:self.root.appendingPathComponent("storage-host.json")))==self.original,"Window close changed SD state")
+            window.orderFront(nil)
+            check(window.isVisible,"Hidden panel could not reopen")
+            // Explicit quit remains unconditional, even with a blocked command.
+            self.began=Date()
+            self.owner.quit()
         }
     }
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
@@ -50,7 +62,7 @@ private final class ExitFixture:NSObject,NSApplicationDelegate {
         check(owner.observer?.isRunning != true,"Owned engine survived exit")
         watchdog?.cancel();timer?.invalidate()
         try? FileManager.default.removeItem(at:root)
-        print("PASS: window close always exits; blocked command cancelled; unknown SD state preserved")
+        print("PASS: window close hides and preserves work; panel reopens; explicit quit cancels blocked work and preserves unknown SD state")
         fflush(stdout)
     }
 }

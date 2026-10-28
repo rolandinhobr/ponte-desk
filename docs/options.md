@@ -28,7 +28,7 @@ Autenticação, liberação de teclas, proteção em falha de rede e isolamento 
 
 O mesmo símbolo aparece no Mac e no Windows. O menu oferece abrir o painel, pausar/retomar teclado e mouse, ajustes, parar webcam e encerrar. Pausar em um lado pausa o par; retomar limpa as pausas manuais nos dois. No modo pelas bordas, continuam valendo o isolamento dos agentes e a proteção de tela cheia.
 
-Use Recolher painel para ocultar a janela sem interromper uma sessão. Encerrar nunca espera autorizações, rede ou arquivos ocupados: cancela os comandos próprios e fecha o motor com prazo limitado. Não força a desmontagem de volumes. Uma limpeza não confirmada permanece registrada para conferência ao reabrir.
+No Mac, o X vermelho ou Recolher painel oculta a janela sem interromper uma sessão. Use Abrir Ponte Desk na barra de menus para exibi-la novamente. Para sair por completo, escolha Encerrar Ponte Desk ou pressione ⌘Q. No Windows, use Recolher painel para manter o app na bandeja; fechar a janela encerra o aplicativo. Encerrar nunca espera autorizações, rede ou arquivos ocupados: cancela os comandos próprios e fecha o motor com prazo limitado. Não força a desmontagem de volumes. Uma limpeza não confirmada permanece registrada para conferência ao reabrir.
 
 ## Periféricos fixos
 
