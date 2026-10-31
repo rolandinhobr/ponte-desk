@@ -147,16 +147,14 @@ struct ListenTask {
 impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
-        let mut last_response = HashMap::new();
-        let mut button_serials = HashMap::<SocketAddr, u32>::new();
-        let mut button_sources = HashSet::new();
+        let mut peers = PeerInputSessions::default();
         let mut rejected_connections = HashMap::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr }) => {
                         log::trace!("{event} <-<-<-<-<- {addr}");
-                        last_response.insert(addr, Instant::now());
+                        peers.responses.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
                                 if !self.emulation_proxy.emulation_active.get() {
@@ -164,7 +162,7 @@ impl ListenTask {
                                     continue;
                                 }
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    button_sources.insert(addr);
+                                    peers.button_sources.insert(addr);
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -174,14 +172,14 @@ impl ListenTask {
                             ProtoEvent::Leave(_) => {
                                 // Retain the sequence tombstone: delayed state must
                                 // not recreate a held button after the route left.
-                                button_sources.remove(&addr);
+                                peers.button_sources.remove(&addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::ButtonSync => self.listener.reply(addr, ProtoEvent::ButtonSync).await,
                             ProtoEvent::PointerButtons {serial,mask} => {
-                                let first=!button_serials.contains_key(&addr);
-                                if button_sources.contains(&addr) && self.emulation_proxy.emulation_active.get() && accept_button_snapshot(&mut button_serials,addr,serial,mask) {
+                                let first=!peers.button_serials.contains_key(&addr);
+                                if self.emulation_proxy.emulation_active.get() && peers.accept_buttons(addr,serial,mask) {
                                     if first {log::info!("receiving synchronized pointer button state from {addr}");}
                                     self.emulation_proxy.sync_buttons(mask,addr);
                                 }
@@ -189,7 +187,7 @@ impl ListenTask {
                             ProtoEvent::Input(event) => {
                                 // Once state sync starts, delayed legacy transitions must
                                 // not re-press a button released by a newer snapshot.
-                                if !button_serials.contains_key(&addr) || !matches!(event,Event::Pointer(PointerEvent::Button {button,..}) if (input_event::BTN_LEFT..=input_event::BTN_FORWARD).contains(&button)) {
+                                if !peers.button_serials.contains_key(&addr) || !matches!(event,Event::Pointer(PointerEvent::Button {button,..}) if (input_event::BTN_LEFT..=input_event::BTN_FORWARD).contains(&button)) {
                                     self.emulation_proxy.consume(event, addr);
                                 }
                             },
@@ -213,8 +211,7 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
-                        button_serials.remove(&addr);
-                        button_sources.remove(&addr);
+                        peers.new_connection(addr);
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
@@ -242,18 +239,11 @@ impl ListenTask {
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
-                    last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
-                            log::warn!("releasing keys: {addr} not responding!");
-                            button_serials.remove(&addr);
-                            button_sources.remove(&addr);
-                            self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    for addr in peers.expire_inputs(Instant::now()) {
+                        log::warn!("releasing keys: {addr} not responding!");
+                        self.emulation_proxy.remove(addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                    }
                 }
             }
         }
@@ -492,6 +482,41 @@ impl EmulationTask {
     }
 }
 
+/// A native-input timeout releases held state, while the authenticated DTLS
+/// connection may remain alive. Keep route authorization and sequence ordering
+/// until an explicit Leave or a new connection changes that route.
+#[derive(Default)]
+struct PeerInputSessions {
+    responses: HashMap<SocketAddr, Instant>,
+    button_serials: HashMap<SocketAddr, u32>,
+    button_sources: HashSet<SocketAddr>,
+}
+impl PeerInputSessions {
+    fn new_connection(&mut self, addr: SocketAddr) {
+        self.button_serials.remove(&addr);
+        self.button_sources.remove(&addr);
+    }
+    fn accept_buttons(&mut self, addr: SocketAddr, serial: u32, mask: u8) -> bool {
+        self.button_sources.contains(&addr)
+            && accept_button_snapshot(&mut self.button_serials, addr, serial, mask)
+    }
+    fn expire_inputs(&mut self, now: Instant) -> Vec<SocketAddr> {
+        let mut expired = Vec::new();
+        self.responses.retain(|&addr, stamp| {
+            if now.saturating_duration_since(*stamp) > Duration::from_secs(1) {
+                // The caller releases native held keys/buttons. Silence is
+                // not a Leave: keep route authorization and sequence tombstones
+                // so fresh clicks resume without replaying an old held drag.
+                expired.push(addr);
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
+}
+
 fn accept_button_snapshot(
     serials: &mut HashMap<SocketAddr, u32>,
     addr: SocketAddr,
@@ -514,6 +539,59 @@ fn accept_button_snapshot(
 #[cfg(test)]
 mod button_snapshot_tests {
     use super::*;
+    #[test]
+    fn clicks_resume_after_input_timeout_on_the_same_connection() {
+        let addr = "127.0.0.1:4242".parse().unwrap();
+        let now = Instant::now();
+        let mut peers = PeerInputSessions::default();
+        peers.new_connection(addr);
+        peers.button_sources.insert(addr);
+        peers.responses.insert(addr, now);
+        assert!(peers.accept_buttons(addr, 40, 1));
+        assert!(peers.accept_buttons(addr, 41, 0));
+        assert_eq!(
+            peers.expire_inputs(now + Duration::from_secs(2)),
+            vec![addr]
+        );
+        // No new Enter is sent when DTLS survives the brief stall. Motion and
+        // keyboard already resume on this connection; buttons must resume too.
+        peers.responses.insert(addr, now + Duration::from_secs(2));
+        assert!(
+            peers.accept_buttons(addr, 42, 1),
+            "timeout made live-route clicks permanently unavailable"
+        );
+        assert!(peers.accept_buttons(addr, 43, 0));
+        assert!(
+            !peers.accept_buttons(addr, 40, 1),
+            "a stale down must not be resurrected"
+        );
+        // An explicit Leave still blocks all later snapshots.
+        peers.button_sources.remove(&addr);
+        assert!(!peers.accept_buttons(addr, 44, 1));
+    }
+    #[test]
+    fn timeout_does_not_repress_a_held_drag_or_reauthorize_a_closed_route() {
+        let addr = "127.0.0.1:4242".parse().unwrap();
+        let now = Instant::now();
+        let mut peers = PeerInputSessions::default();
+        peers.button_sources.insert(addr);
+        peers.responses.insert(addr, now);
+        assert!(peers.accept_buttons(addr, 10, 1));
+        peers.expire_inputs(now + Duration::from_secs(2));
+        assert!(
+            !peers.accept_buttons(addr, 10, 1),
+            "held snapshot replayed after native cleanup"
+        );
+        assert!(peers.accept_buttons(addr, 11, 0));
+        peers.button_sources.remove(&addr);
+        peers.responses.insert(addr, now);
+        peers.expire_inputs(now + Duration::from_secs(2));
+        assert!(!peers.accept_buttons(addr, 12, 1));
+        peers.new_connection(addr);
+        assert!(!peers.accept_buttons(addr, 0, 1));
+        peers.button_sources.insert(addr);
+        assert!(peers.accept_buttons(addr, 0, 1));
+    }
     #[test]
     fn duplicate_and_reordered_snapshots_cannot_repress_released_button() {
         let addr = "127.0.0.1:4242".parse().unwrap();
