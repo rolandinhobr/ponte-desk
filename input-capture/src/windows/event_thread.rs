@@ -3,12 +3,12 @@ use std::collections::HashSet;
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
-use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
     EnumDisplayDevicesW, EnumDisplaySettingsW,
@@ -19,12 +19,13 @@ use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW,
-    EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
+    RegisterClassW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW,
 };
 
 use input_event::{
@@ -41,6 +42,7 @@ pub(crate) struct EventThread {
     thread_id: u32,
     stopping: Arc<AtomicBool>,
     release_pending: Arc<AtomicBool>,
+    physical_buttons: Arc<AtomicU32>,
 }
 
 impl EventThread {
@@ -50,11 +52,13 @@ impl EventThread {
         let request_buffer = Default::default();
         let stopping = Arc::new(AtomicBool::new(false));
         let release_pending = Arc::new(AtomicBool::new(false));
+        let physical_buttons = Arc::new(AtomicU32::new(0));
         let (thread, thread_id) = start(
             event_tx,
             Arc::clone(&request_buffer),
             Arc::clone(&stopping),
             Arc::clone(&release_pending),
+            Arc::clone(&physical_buttons),
         )?;
         Ok(Self {
             request_buffer,
@@ -62,7 +66,12 @@ impl EventThread {
             thread_id,
             stopping,
             release_pending,
+            physical_buttons,
         })
+    }
+
+    pub(crate) fn physical_buttons(&self) -> u32 {
+        self.physical_buttons.load(Ordering::Acquire)
     }
 
     pub(crate) fn release_capture(&self) {
@@ -76,6 +85,10 @@ impl EventThread {
 
     pub(crate) fn destroy(&self, pos: Position) {
         self.client_update(ClientUpdate::Destroy(pos));
+    }
+
+    pub(crate) fn direct(&self, pos: Option<Position>) {
+        self.client_update(ClientUpdate::Direct(pos));
     }
 
     fn exit(&self) {
@@ -126,6 +139,7 @@ enum RequestType {
 }
 
 enum ClientUpdate {
+    Direct(Option<Position>),
     Create(Position),
     Destroy(Position),
 }
@@ -151,6 +165,23 @@ fn try_send_event(
         }
         None => Err(TrySendError::Closed((pos, event))),
     })
+}
+
+thread_local! {static PHYSICAL_BUTTONS:RefCell<Option<Arc<AtomicU32>>>=const{RefCell::new(None)};}
+fn record_physical_button(event: Option<PointerEvent>) {
+    if let Some(PointerEvent::Button { button, state, .. }) = event {
+        if let Some(index) = button.checked_sub(BTN_LEFT).filter(|i| *i < 5) {
+            PHYSICAL_BUTTONS.with_borrow(|shared| {
+                if let Some(shared) = shared {
+                    if state == 1 {
+                        shared.fetch_or(1 << index, Ordering::Release);
+                    } else {
+                        shared.fetch_and(!(1 << index), Ordering::Release);
+                    }
+                }
+            });
+        }
+    }
 }
 
 thread_local! {
@@ -280,11 +311,13 @@ fn start(
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     stopping: Arc<AtomicBool>,
     release_pending: Arc<AtomicBool>,
+    physical_buttons: Arc<AtomicU32>,
 ) -> Result<(thread::JoinHandle<()>, u32), CaptureCreationError> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let msg_thread = thread::Builder::new()
         .name("windows-input-capture".into())
         .spawn(move || {
+            PHYSICAL_BUTTONS.replace(Some(physical_buttons));
             start_routine(
                 ready_tx,
                 event_tx,
@@ -362,6 +395,9 @@ fn start_routine(
 }
 
 fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
+    if activate_direct() {
+        return true;
+    }
     if wparam.0 != WM_MOUSEMOVE as usize {
         return ACTIVE_CLIENT.get().is_some();
     }
@@ -427,6 +463,30 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         PREV_POS.set(None);
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
+    if !crate::input_origin::windows_mouse_is_software(event.flags)
+        && matches!(
+            wparam.0 as u32,
+            WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+                | WM_XBUTTONDOWN
+                | WM_XBUTTONUP
+        )
+    {
+        record_physical_button(to_mouse_event(wparam, lparam));
+    }
+    if DIRECT_CLIENT.get().is_some() {
+        let mut point = POINT::default();
+        if GetCursorPos(&mut point).is_err() {
+            DIRECT_CLIENT.set(None);
+            ACTIVE_CLIENT.set(None);
+            return CallNextHookEx(None, ncode, wparam, lparam);
+        }
+        ENTRY_POINT.set((point.x, point.y));
+    }
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -469,6 +529,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
     /* get active client if any */
+    activate_direct();
     let Some(client) = ACTIVE_CLIENT.get() else {
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
@@ -560,6 +621,11 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
 
 fn update_clients(request: ClientUpdate) {
     match request {
+        ClientUpdate::Direct(pos) => {
+            ACTIVE_CLIENT.set(None);
+            PREV_POS.set(None);
+            DIRECT_CLIENT.set(pos);
+        }
         ClientUpdate::Create(pos) => {
             CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
         }
@@ -572,6 +638,23 @@ fn update_clients(request: ClientUpdate) {
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
         }
     }
+}
+
+thread_local! {static DIRECT_CLIENT:Cell<Option<Position>>=const{Cell::new(None)};}
+fn activate_direct() -> bool {
+    let Some(pos) = DIRECT_CLIENT.get() else {
+        return false;
+    };
+    if ACTIVE_CLIENT.get().is_none() {
+        if !CLIENTS.with_borrow(|clients| clients.contains(&pos))
+            || try_send_event(pos, CaptureEvent::Begin).is_err()
+        {
+            DIRECT_CLIENT.set(None);
+            return false;
+        }
+        ACTIVE_CLIENT.set(Some(pos));
+    }
+    true
 }
 
 fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
@@ -692,6 +775,47 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
 mod lifecycle_tests {
     use super::*;
 
+    #[test]
+    fn direct_route_starts_on_a_physical_key_and_ignores_injected_keys() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        EVENT_TX.replace(Some(tx));
+        update_clients(ClientUpdate::Create(Position::Left));
+        update_clients(ClientUpdate::Direct(Some(Position::Left)));
+        let mut key = KBDLLHOOKSTRUCT {
+            scanCode: 0x1e,
+            ..Default::default()
+        };
+        key.flags = windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT_FLAGS(0x10);
+        unsafe {
+            kybrd_proc(
+                0,
+                WPARAM(WM_KEYDOWN as usize),
+                LPARAM((&key as *const KBDLLHOOKSTRUCT) as isize),
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(ACTIVE_CLIENT.get().is_none());
+        key.flags = Default::default();
+        let result = unsafe {
+            kybrd_proc(
+                0,
+                WPARAM(WM_KEYDOWN as usize),
+                LPARAM((&key as *const KBDLLHOOKSTRUCT) as isize),
+            )
+        };
+        assert_eq!(result, LRESULT(1));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (Position::Left, CaptureEvent::Begin)
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap().1,
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { state: 1, .. }))
+        ));
+        update_clients(ClientUpdate::Direct(None));
+        update_clients(ClientUpdate::Destroy(Position::Left));
+        EVENT_TX.take();
+    }
     #[test]
     fn motion_backlog_reserves_capacity_for_critical_transitions() {
         let (tx, _rx) = tokio::sync::mpsc::channel(128);

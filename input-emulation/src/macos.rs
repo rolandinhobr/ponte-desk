@@ -16,11 +16,10 @@ use input_event::{
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
 
@@ -35,16 +34,46 @@ pub(crate) struct MacOSEmulation {
     repeat_task: Option<JoinHandle<()>>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
-    /// button previously pressed (evdev button code)
-    previous_button: Option<u32>,
-    /// timestamp of previous click (button down)
-    previous_button_click: Option<Instant>,
-    /// click state, i.e. number of clicks in quick succession
-    button_click_state: i64,
+    clicks: ClickTracker,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
-    /// notify to cancel key repeats
-    notify_repeat_task: Arc<Notify>,
+    /// Persistent cancellation for this key only, including before first poll.
+    repeat_cancel: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+struct ClickTracker {
+    previous: Option<(u32, CGPoint, Instant, i64)>,
+    held: HashMap<u32, i64>,
+}
+impl ClickTracker {
+    fn moved(&mut self, position: CGPoint) {
+        if self.previous.is_some_and(|(_, p, _, _)| {
+            (p.x - position.x).abs() > 4. || (p.y - position.y).abs() > 4.
+        }) {
+            self.previous = None;
+        }
+    }
+    fn transition(&mut self, button: u32, state: u32, position: CGPoint, now: Instant) -> i64 {
+        if state == 0 {
+            return self.held.remove(&button).unwrap_or(1);
+        }
+        if let Some(count) = self.held.get(&button) {
+            return *count;
+        }
+        let count = self
+            .previous
+            .filter(|(b, p, t, _)| {
+                *b == button
+                    && now.duration_since(*t) < DOUBLE_CLICK_INTERVAL
+                    && (p.x - position.x).abs() <= 4.
+                    && (p.y - position.y).abs() <= 4.
+            })
+            .map_or(1, |(_, _, _, n)| n.saturating_add(1));
+        self.previous = Some((button, position, now, count));
+        self.held.insert(button, count);
+        count
+    }
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -80,11 +109,9 @@ impl MacOSEmulation {
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
-            previous_button: None,
-            previous_button_click: None,
-            button_click_state: 0,
+            clicks: ClickTracker::default(),
             repeat_task: None,
-            notify_repeat_task: Arc::new(Notify::new()),
+            repeat_cancel: None,
             modifier_state: Rc::new(Cell::new(XMods::empty())),
         })
     }
@@ -102,46 +129,52 @@ impl MacOSEmulation {
         key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
         // repeat task
         let event_source = self.event_source.clone();
-        let notify = self.notify_repeat_task.clone();
+        let (cancel, cancelled) = oneshot::channel();
+        self.repeat_cancel = Some(cancel);
         let modifiers = self.modifier_state.clone();
-        let repeat_task = tokio::task::spawn_local(async move {
-            let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
-                _ = notify.notified() => true,
-            };
-            if !stop {
-                loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
-                    tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
-                        _ = notify.notified() => break,
-                    }
-                }
-            }
-            // Always release the key with the correct CGKeyCode, regardless of
-            // whether the repeat loop ran. This matches @feschber's review
-            // request: "still release the key repeat task but with the correct
-            // code."
-            //
-            // Do NOT call update_modifiers here: `key` is a Mac CGKeyCode but
-            // update_modifiers expects a Linux evdev scancode, and the two
-            // codespaces collide (e.g. Mac LeftShift=56 == Linux KeyLeftAlt=56,
-            // Mac Down=125 == Linux KeyLeftMeta=125), corrupting modifier
-            // state for chords like Shift+Option+X or Cmd+Down. Modifier state
-            // is owned by the main consume() loop, which already calls
-            // update_modifiers with the correct Linux scancode on the real key
-            // release event from the client.
-            key_event(event_source.clone(), key, 0, modifiers.get());
-        });
+        let repeat_task = tokio::task::spawn_local(repeat_key_events(
+            cancelled,
+            DEFAULT_REPEAT_DELAY,
+            DEFAULT_REPEAT_INTERVAL,
+            move |state| {
+                key_event(event_source.clone(), key, state, modifiers.get());
+            },
+        ));
         self.repeat_task = Some(repeat_task);
     }
 
     async fn cancel_repeat_task(&mut self) {
+        if let Some(cancel) = self.repeat_cancel.take() {
+            let _ = cancel.send(());
+        }
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
             let _ = task.await;
         }
     }
+}
+
+// Run the repeat loop separately so cancellation timing can be tested without
+// creating or posting any native input events.
+async fn repeat_key_events(
+    mut cancelled: oneshot::Receiver<()>,
+    delay: Duration,
+    interval: Duration,
+    mut emit: impl FnMut(u8),
+) {
+    let mut wait = delay;
+    loop {
+        tokio::select! {
+            // A release already sent must win even if the timer is also ready.
+            biased;
+            _ = &mut cancelled => break,
+            _ = tokio::time::sleep(wait) => emit(1),
+        }
+        wait = interval;
+    }
+    // Preserve the unconditional key-up requested in @feschber's review.
+    // The captured code is a Mac CGKeyCode: never translate it as a Linux
+    // scancode or change modifiers here; the real key release owns that state.
+    emit(0);
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
@@ -328,14 +361,20 @@ impl Emulation for MacOSEmulation {
                         let event_type = self
                             .pressed_buttons
                             .iter()
-                            .next()
+                            .min()
                             .map(|&btn| drag_event_type(btn))
                             .unwrap_or(CGEventType::MouseMoved);
+                        self.clicks.moved(mouse_location);
+                        let mouse_button = match event_type {
+                            CGEventType::RightMouseDragged => CGMouseButton::Right,
+                            CGEventType::OtherMouseDragged => CGMouseButton::Center,
+                            _ => CGMouseButton::Left,
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
                             mouse_location,
-                            CGMouseButton::Left,
+                            mouse_button,
                         ) {
                             Ok(e) => e,
                             Err(_) => {
@@ -384,24 +423,12 @@ impl Emulation for MacOSEmulation {
                             self.pressed_buttons.remove(&button);
                         }
 
-                        // update double-click tracking using the evdev button
-                        // code so that back/forward don't alias with middle
-                        if state == 1 {
-                            if self.previous_button == Some(button)
-                                && self
-                                    .previous_button_click
-                                    .is_some_and(|i| i.elapsed() < DOUBLE_CLICK_INTERVAL)
-                            {
-                                self.button_click_state += 1;
-                            } else {
-                                self.button_click_state = 1;
-                            }
-                            self.previous_button = Some(button);
-                            self.previous_button_click = Some(Instant::now());
-                        }
-
-                        log::debug!("click_state: {}", self.button_click_state);
-                        let location = self.get_mouse_location().unwrap();
+                        let Some(location) = self.get_mouse_location() else {
+                            return Ok(());
+                        };
+                        let click_state =
+                            self.clicks
+                                .transition(button, state, location, Instant::now());
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
@@ -416,7 +443,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(
                             EventField::MOUSE_EVENT_CLICK_STATE,
-                            self.button_click_state,
+                            click_state,
                         );
                         // Set the button number for extra buttons (back=3, forward=4)
                         if let Some(btn_num) = cg_button_number {
@@ -480,11 +507,6 @@ impl Emulation for MacOSEmulation {
                         event.post(CGEventTapLocation::HID);
                     }
                 }
-
-                // reset button click state in case it's not a button event
-                if !matches!(pointer_event, PointerEvent::Button { .. }) {
-                    self.button_click_state = 0;
-                }
             }
             Event::Keyboard(keyboard_event) => match keyboard_event {
                 KeyboardEvent::Key {
@@ -537,7 +559,9 @@ impl Emulation for MacOSEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
+    }
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -678,5 +702,161 @@ mod scroll_direction_tests {
     fn invalid_axis_is_rejected_and_extreme_delta_does_not_overflow() {
         assert_eq!(quartz_scroll_wheels(2, 120), None);
         assert_eq!(quartz_scroll_wheels(0, i32::MIN), Some((1, i32::MAX, 0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod repeat_cancellation_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[tokio::test]
+    async fn repeat_cancellation_before_first_poll_never_hangs() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (cancel, cancelled) = oneshot::channel();
+                let states = Rc::new(RefCell::new(Vec::new()));
+                let recorded = states.clone();
+                let task = tokio::task::spawn_local(repeat_key_events(
+                    cancelled,
+                    DEFAULT_REPEAT_DELAY,
+                    DEFAULT_REPEAT_INTERVAL,
+                    move |state| {
+                        recorded.borrow_mut().push(state);
+                    },
+                ));
+                // Reproduces the fast down/up race before the repeat task runs.
+                cancel.send(()).unwrap();
+                let completed = tokio::time::timeout(Duration::from_millis(100), task).await;
+                assert!(
+                    completed.is_ok(),
+                    "key release lost its cancellation signal"
+                );
+                assert_eq!(&*states.borrow(), &[0]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn active_repeat_cancels_and_releases_exactly_once() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (cancel, cancelled) = oneshot::channel();
+                let (began, started) = oneshot::channel();
+                let mut began = Some(began);
+                let states = Rc::new(RefCell::new(Vec::new()));
+                let recorded = states.clone();
+                let task = tokio::task::spawn_local(repeat_key_events(
+                    cancelled,
+                    Duration::ZERO,
+                    Duration::from_secs(60),
+                    move |state| {
+                        recorded.borrow_mut().push(state);
+                        if state == 1 {
+                            if let Some(began) = began.take() {
+                                let _ = began.send(());
+                            }
+                        }
+                    },
+                ));
+                tokio::time::timeout(Duration::from_secs(2), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                cancel.send(()).unwrap();
+                tokio::time::timeout(Duration::from_millis(100), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&*states.borrow(), &[1, 0]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fast_key_pairs_do_not_share_or_lose_cancellation() {
+        for _ in 0..1000 {
+            let (cancel, cancelled) = oneshot::channel();
+            let mut states = Vec::new();
+            cancel.send(()).unwrap();
+            repeat_key_events(
+                cancelled,
+                DEFAULT_REPEAT_DELAY,
+                DEFAULT_REPEAT_INTERVAL,
+                |state| states.push(state),
+            )
+            .await;
+            assert_eq!(states, vec![0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_cancellation_owner_still_releases_key() {
+        let (cancel, cancelled) = oneshot::channel();
+        drop(cancel);
+        let mut states = Vec::new();
+        repeat_key_events(
+            cancelled,
+            DEFAULT_REPEAT_DELAY,
+            DEFAULT_REPEAT_INTERVAL,
+            |state| states.push(state),
+        )
+        .await;
+        assert_eq!(states, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod click_tracking_tests {
+    use super::*;
+    #[test]
+    fn click_release_keeps_count_during_motion_and_double_click_requires_proximity() {
+        let mut clicks = ClickTracker::default();
+        let now = Instant::now();
+        let p = CGPoint::new(10., 10.);
+        assert_eq!(clicks.transition(BTN_LEFT, 1, p, now), 1);
+        clicks.moved(CGPoint::new(11., 10.));
+        assert_eq!(clicks.transition(BTN_LEFT, 0, p, now), 1);
+        assert_eq!(
+            clicks.transition(BTN_LEFT, 1, p, now + Duration::from_millis(100)),
+            2
+        );
+        clicks.moved(CGPoint::new(300., 200.));
+        assert_eq!(
+            clicks.transition(BTN_LEFT, 0, CGPoint::new(300., 200.), now),
+            2
+        );
+        assert_eq!(
+            clicks.transition(
+                BTN_LEFT,
+                1,
+                CGPoint::new(300., 200.),
+                now + Duration::from_millis(200)
+            ),
+            1
+        );
+    }
+    #[test]
+    fn rapid_clicks_at_different_locations_and_duplicate_down_are_single_clicks() {
+        let mut c = ClickTracker::default();
+        let now = Instant::now();
+        let p = CGPoint::new(1., 1.);
+        assert_eq!(c.transition(BTN_LEFT, 1, p, now), 1);
+        assert_eq!(c.transition(BTN_LEFT, 1, p, now), 1);
+        assert_eq!(c.transition(BTN_LEFT, 0, p, now), 1);
+        assert_eq!(
+            c.transition(
+                BTN_LEFT,
+                1,
+                CGPoint::new(200., 200.),
+                now + Duration::from_millis(10)
+            ),
+            1
+        );
+        assert_eq!(
+            c.transition(BTN_RIGHT, 1, p, now + Duration::from_millis(20)),
+            1
+        );
+        assert_eq!(c.transition(BTN_LEFT, 0, p, now), 1);
     }
 }

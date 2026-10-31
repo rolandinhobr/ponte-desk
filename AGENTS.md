@@ -5,12 +5,14 @@
 - One integrated application per system. Do not add resident scripting observers or paid runtime dependencies.
 - Use metadata and worker-based DDC; never capture the screen to detect monitor input, fullscreen or agent activity.
 - Preserve local control on network failure. Release pressed keys/buttons during suspension and verify actual native state separately from desired policy and transport.
-- Isolate desktop automation with `ponte-desk agent begin --owner agent --ttl 180`; keep the token, renew every60seconds and end in a finally path. Never remove another session's lease. Operate each desktop directly.
+- Isolate desktop automation with `ponte-desk agent begin --owner agent --ttl 180`; keep the token, renew every 60 seconds and end in a finally path. Never remove another session's lease. Operate each desktop directly.
 - Never commit real pairing configuration, private certificates, keys, input logs or private webcam frames. Use fictitious examples and isolated runtime directories.
 - Freeze source before installation and permission renewal. Test logic and dummy backends before native deployment.
 - External webcam sharing is manual and bidirectional. Never replace a missing external device with an integrated camera. Do not promise generic USB redirection.
 - Keep signed system components intact. User-visible device properties may be configured through supported APIs; preserve attribution and do not weaken system security.
 - Dummy tests do not prove game, anticheat, conferencing-app or virtual-HID compatibility.
+
+- Removable-media sharing is manual and read-only. Never accept an arbitrary directory as a card. Bind sessions to the volume identity, refuse forced unmount, and preserve unrelated SMB shares, mappings and firewall rules. Elevated helpers must not write user-selected log paths.
 
 # Lan Mouse Agent Instructions
 

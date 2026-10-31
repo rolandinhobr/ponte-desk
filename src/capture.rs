@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashSet, VecDeque},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -8,13 +9,13 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{LanMouseConnection, LanMouseConnectionError};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -24,6 +25,7 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
+    DirectMode(bool),
     /// a client was entered
     CaptureBegin(CaptureHandle),
     /// capture disabled
@@ -58,6 +60,7 @@ pub(crate) enum CaptureType {
 
 #[derive(Clone, Debug)]
 enum CaptureRequest {
+    Direct(bool),
     /// capture must release the mouse
     Release,
     /// add a capture client
@@ -83,6 +86,12 @@ impl Capture {
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            direct: false,
+            pending_direct: VecDeque::new(),
+            button_sync_clients: HashSet::new(),
+            button_serial: crate::integration::now_ms() as u32,
+            button_mask: 0,
+            waiting_since: None,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -106,6 +115,10 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::Reenable)
             .expect("channel closed");
+    }
+
+    pub(crate) fn direct(&self, value: bool) {
+        let _ = self.request_tx.send(CaptureRequest::Direct(value));
     }
 
     pub(crate) fn suspend(&self, suspended: bool) {
@@ -173,6 +186,12 @@ macro_rules! debounce {
 }
 
 struct CaptureTask {
+    direct: bool,
+    pending_direct: VecDeque<Event>,
+    button_sync_clients: HashSet<CaptureHandle>,
+    button_serial: u32,
+    button_mask: u8,
+    waiting_since: Option<Instant>,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
@@ -226,6 +245,7 @@ impl CaptureTask {
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
+                        CaptureRequest::Direct(value)=>{self.direct=value;},
                         CaptureRequest::Reenable if !self.suspended => break,
                         CaptureRequest::Reenable => {},
                         CaptureRequest::Suspend(value) => {
@@ -265,6 +285,7 @@ impl CaptureTask {
             return Err(e.into());
         }
 
+        self.apply_direct(&mut capture).await?;
         let r = self.do_capture_session(&mut capture).await;
 
         // FIXME replace with async drop when stabilized
@@ -284,12 +305,67 @@ impl CaptureTask {
         Ok(())
     }
 
+    async fn apply_direct(&self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        let handle = if self.direct {
+            self.captures
+                .iter()
+                .find(|(_, _, t)| *t == CaptureType::Default)
+                .map(|(h, _, _)| *h)
+        } else {
+            None
+        };
+        capture.direct(handle).await?;
+        let _ = self
+            .event_tx
+            .send(ICaptureEvent::DirectMode(handle.is_some()));
+        Ok(())
+    }
+    fn pause_direct(&self) {
+        if self.direct {
+            let _ = std::fs::write(
+                crate::integration::preferences_root().join("manual-pause"),
+                b"direct input released",
+            );
+        }
+    }
+
+    async fn send_input(
+        &mut self,
+        event: Event,
+        handle: CaptureHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        let event = button_wire_event(
+            event,
+            self.button_sync_clients.contains(&handle),
+            &mut self.button_serial,
+            &mut self.button_mask,
+        );
+        self.conn.send(event, handle).await
+    }
+
     async fn do_capture_session(
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let mut handshake = tokio::time::interval(Duration::from_millis(250));
+        let mut buttons = tokio::time::interval(Duration::from_millis(100));
+        buttons.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _=buttons.tick(), if self.active_client.is_some() && self.state == State::Sending => {
+                    let handle=self.active_client.unwrap();
+                    let event=if self.button_sync_clients.contains(&handle) {
+                        ProtoEvent::PointerButtons {serial:self.button_serial,mask:self.button_mask}
+                    } else { ProtoEvent::ButtonSync };
+                    if self.conn.send(event,handle).await.is_err(){self.pause_direct();self.release_capture(capture).await?;}
+                },
+                _=handshake.tick(), if self.direct && self.waiting_since.is_some()=>{
+                    if self.waiting_since.is_some_and(|t|t.elapsed()>Duration::from_secs(2)) {
+                        self.pause_direct();self.release_capture(capture).await?;
+                    } else if let Some(handle)=self.active_client {
+                        if let Err(error)=self.conn.send(ProtoEvent::Enter(to_proto_pos(self.get_pos(handle).opposite())),handle).await{if !matches!(error,LanMouseConnectionError::NotConnected|LanMouseConnectionError::TargetEmulationDisabled){self.pause_direct();self.release_capture(capture).await?;}}
+                    }
+                },
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
@@ -304,20 +380,25 @@ impl CaptureTask {
                     }
 
                     match event {
+                        ProtoEvent::ButtonSync => { if self.button_sync_clients.insert(handle) { log::info!("pointer button state synchronization enabled for client {handle}"); } }
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
-                            self.state = State::Sending;
+                            self.state = State::Sending;self.waiting_since=None;
+                            while let Some(event)=self.pending_direct.pop_front(){
+                                if self.send_input(event,handle).await.is_err(){self.pause_direct();self.release_capture(capture).await?;break;}
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                            self.pause_direct();self.release_capture(capture).await?;
                         },
                         _ => {}
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
+                    CaptureRequest::Direct(value)=>{if value!=self.direct{self.release_capture(capture).await?;self.direct=value;self.apply_direct(capture).await?;}},
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Suspend(true) => {
                         self.suspended = true;
@@ -325,10 +406,11 @@ impl CaptureTask {
                         return Ok(());
                     },
                     CaptureRequest::Suspend(false) => {},
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release => {self.pause_direct();self.release_capture(capture).await?;},
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
+                        if self.direct{self.apply_direct(capture).await?;}
                     }
                     CaptureRequest::Destroy(h) => {
                         // If the capture we're tearing down is the
@@ -364,6 +446,7 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
+            self.pause_direct();
             return self.release_capture(capture).await;
         }
 
@@ -388,6 +471,9 @@ impl CaptureTask {
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
+            if self.direct {
+                self.waiting_since = Some(Instant::now());
+            }
             self.active_client.replace(handle);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
@@ -400,26 +486,68 @@ impl CaptureTask {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
+                State::WaitingForAck if self.direct => {
+                    if !queue_direct(&mut self.pending_direct, e) {
+                        self.pause_direct();
+                        return self.release_capture(capture).await;
+                    }
+                    return Ok(());
+                }
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
                 State::Sending => ProtoEvent::Input(e),
             },
         };
 
-        if let Err(e) = self.conn.send(event, handle).await {
+        let result = match event {
+            ProtoEvent::Input(e) => self.send_input(e, handle).await,
+            e => self.conn.send(e, handle).await,
+        };
+        if let Err(e) = result {
+            if self.direct
+                && self.state == State::WaitingForAck
+                && matches!(
+                    e,
+                    LanMouseConnectionError::NotConnected
+                        | LanMouseConnectionError::TargetEmulationDisabled
+                )
+            {
+                return Ok(());
+            }
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
             // Funnel through release_capture so the leave_hook
             // fires and active_client is cleared (without this the
             // active_client field would stay stale until the next
             // Begin from a different handle).
+            self.pause_direct();
             self.release_capture(capture).await?;
         }
         Ok(())
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.pending_direct.clear();
+        self.waiting_since = None;
+        if self.direct {
+            capture.direct(None).await?;
+            let _ = self.event_tx.send(ICaptureEvent::DirectMode(false));
+        }
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            self.button_mask = 0;
+            self.button_serial = self.button_serial.wrapping_add(1);
+            if self.button_sync_clients.contains(&handle) {
+                let _ = self
+                    .conn
+                    .send(
+                        ProtoEvent::PointerButtons {
+                            serial: self.button_serial,
+                            mask: 0,
+                        },
+                        handle,
+                    )
+                    .await;
+            }
             // Surface the leave to the service layer so it can fire
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer
@@ -482,6 +610,69 @@ enum State {
     Sending,
 }
 
+fn button_wire_event(event: Event, supported: bool, serial: &mut u32, mask: &mut u8) -> ProtoEvent {
+    if let Event::Pointer(PointerEvent::Button { button, state, .. }) = event {
+        if let Some(index) = button.checked_sub(input_event::BTN_LEFT).filter(|i| *i < 5) {
+            let next = if state == 1 {
+                *mask | (1 << index)
+            } else {
+                *mask & !(1 << index)
+            };
+            if next != *mask {
+                *mask = next;
+                *serial = serial.wrapping_add(1);
+            }
+            if supported {
+                return ProtoEvent::PointerButtons {
+                    serial: *serial,
+                    mask: *mask,
+                };
+            }
+        }
+    }
+    ProtoEvent::Input(event)
+}
+#[cfg(test)]
+mod button_wire_tests {
+    use super::*;
+    fn button(state: u32) -> Event {
+        Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: input_event::BTN_LEFT,
+            state,
+        })
+    }
+    #[test]
+    fn negotiated_full_state_preserves_legacy_and_ignores_duplicate_transitions() {
+        let (mut serial, mut mask) = (40, 0);
+        assert!(matches!(
+            button_wire_event(button(1), false, &mut serial, &mut mask),
+            ProtoEvent::Input(_)
+        ));
+        assert!(matches!(
+            button_wire_event(button(1), true, &mut serial, &mut mask),
+            ProtoEvent::PointerButtons {
+                serial: 41,
+                mask: 1
+            }
+        ));
+        assert!(matches!(
+            button_wire_event(button(0), true, &mut serial, &mut mask),
+            ProtoEvent::PointerButtons {
+                serial: 42,
+                mask: 0
+            }
+        ));
+        assert!(matches!(
+            button_wire_event(button(0), true, &mut serial, &mut mask),
+            ProtoEvent::PointerButtons {
+                serial: 42,
+                mask: 0
+            }
+        ));
+    }
+}
+
 fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
     match pos {
         lan_mouse_ipc::Position::Left => input_capture::Position::Left,
@@ -518,5 +709,92 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+// Coalesce high-rate pointer motion while retaining ordered key/button transitions
+// until Enter is acknowledged. Capacity is fixed even if the peer is unresponsive.
+fn queue_direct(queue: &mut VecDeque<Event>, event: Event) -> bool {
+    if let Event::Pointer(input_event::PointerEvent::Motion { time, dx, dy }) = event {
+        if let Some(Event::Pointer(input_event::PointerEvent::Motion {
+            time: last_time,
+            dx: last_dx,
+            dy: last_dy,
+        })) = queue.back_mut()
+        {
+            *last_time = time;
+            *last_dx += dx;
+            *last_dy += dy;
+            return true;
+        }
+    }
+    if queue.len() >= 128 {
+        return false;
+    }
+    queue.push_back(event);
+    true
+}
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+    #[test]
+    fn first_key_and_release_survive_high_rate_motion_before_ack() {
+        let mut queue = VecDeque::new();
+        let down = Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: 30,
+            state: 1,
+        });
+        let up = Event::Keyboard(KeyboardEvent::Key {
+            time: 1,
+            key: 30,
+            state: 0,
+        });
+        assert!(queue_direct(&mut queue, down));
+        for _ in 0..1000 {
+            assert!(queue_direct(
+                &mut queue,
+                Event::Pointer(input_event::PointerEvent::Motion {
+                    time: 0,
+                    dx: 1.,
+                    dy: 2.
+                })
+            ));
+        }
+        assert!(queue_direct(&mut queue, up));
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.pop_front(), Some(down));
+        assert_eq!(
+            queue.pop_front(),
+            Some(Event::Pointer(input_event::PointerEvent::Motion {
+                time: 0,
+                dx: 1000.,
+                dy: 2000.
+            }))
+        );
+        assert_eq!(queue.pop_front(), Some(up));
+    }
+    #[test]
+    fn stalled_peer_has_a_bounded_transition_queue() {
+        let mut queue = VecDeque::new();
+        for i in 0..128 {
+            assert!(queue_direct(
+                &mut queue,
+                Event::Keyboard(KeyboardEvent::Key {
+                    time: i,
+                    key: 30,
+                    state: (i % 2) as u8
+                })
+            ));
+        }
+        assert!(!queue_direct(
+            &mut queue,
+            Event::Keyboard(KeyboardEvent::Key {
+                time: 129,
+                key: 30,
+                state: 0
+            })
+        ));
+        assert_eq!(queue.len(), 128);
     }
 }

@@ -81,6 +81,7 @@ struct InputCaptureState {
     active_clients: Lazy<HashSet<Position>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
+    direct_pos: Option<Position>,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
     /// bounds of the input capture area
@@ -92,6 +93,7 @@ struct InputCaptureState {
 
 #[derive(Debug)]
 enum ProducerEvent {
+    Direct(Option<Position>),
     Release,
     Create(Position),
     Destroy(Position),
@@ -105,6 +107,7 @@ impl InputCaptureState {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
+            direct_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
@@ -187,6 +190,9 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
+            ProducerEvent::Direct(pos) => {
+                self.direct_pos = pos;
+            }
             ProducerEvent::Release => {
                 if self.current_pos.is_some() {
                     self.show_cursor()?;
@@ -631,6 +637,21 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        // Synthetic events already returned above. A key can begin a fixed route.
+        if state.current_pos.is_none() {
+            if let Some(pos) = state
+                .direct_pos
+                .filter(|p| state.active_clients.contains(p))
+            {
+                if state.start_capture(cg_ev, pos).is_err() {
+                    state.direct_pos = None;
+                    return CallbackResult::Keep;
+                }
+                state.current_pos = Some(pos);
+                let _ = state.hide_cursor();
+                res_events.push(CaptureEvent::Begin);
+            }
+        }
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
@@ -891,6 +912,11 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
+    fn direct(&mut self, pos: Option<Position>) -> Result<(), CaptureError> {
+        self.notify_tx
+            .try_send(ProducerEvent::Direct(pos))
+            .map_err(|_| CaptureError::ActivationClosed)
+    }
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {

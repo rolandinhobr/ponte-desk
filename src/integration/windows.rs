@@ -464,7 +464,10 @@ pub fn monitor_catalog() -> serde_json::Value {
 }
 fn read_monitor_input() -> DdcSample {
     let options = crate::preferences::Preferences::load(&super::native::root());
-    if !options.shared_monitor || options.windows_monitor.is_empty() {
+    if options.input_mode != "edges"
+        || !options.shared_monitor
+        || options.windows_monitor.is_empty()
+    {
         return DdcSample::default();
     }
     scan_monitors(options.windows_monitor, false).sample

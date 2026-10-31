@@ -2,7 +2,7 @@
 <h1 align="center">Ponte Desk</h1>
 <p align="center">Seus computadores, juntos.</p>
 
-Um aplicativo gratuito e aberto para compartilhar teclado, mouse e webcam externa entre um Mac e um computador Windows na mesma rede. Interface nativa, uso manual da câmera e recursos que você pode ativar conforme sua rotina.
+Um aplicativo gratuito e aberto para compartilhar teclado, mouse, webcam externa e cartão SD entre um Mac e um computador Windows na mesma rede. Interface nativa, uso manual da câmera e recursos que você pode ativar conforme sua rotina.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/ponte-desk-dark.png">
@@ -11,8 +11,9 @@ Um aplicativo gratuito e aberto para compartilhar teclado, mouse e webcam extern
 
 ## Escolha o que compartilhar
 
-- **Teclado e mouse:** atravesse a borda entre as telas para controlar o outro computador. Escolha se ele fica à esquerda, à direita, acima ou abaixo.
+- **Teclado e mouse:** use a travessia pelas bordas ou fixe os periféricos dos dois computadores no Mac ou no Windows. No modo fixo, o primeiro movimento ou tecla já vai ao destino, sem trocar telas ou entradas do monitor.
 - **Webcam externa:** deixe o USB em qualquer um dos computadores e compartilhe quando precisar. Captura em 1080p/30 ou 720p/30 para reduzir o tráfego. A câmera começa desligada.
+- **Cartão SD:** publique uma mídia removível em somente leitura e monte no outro computador pelo Finder ou Explorer. Sem copiar o cartão inteiro antes. [Configuração e limites](docs/storage.md).
 - **Monitor compartilhado, opcional:** para quem alterna a entrada de um mesmo monitor entre os computadores. A configuração identifica o monitor e suas entradas; a automação pode reorganizar as telas do Mac e restaurá-las depois.
 - **Proteção de tela cheia:** opções separadas para pausar o compartilhamento durante tela cheia no Windows e impedir a saída do cursor durante tela cheia no Mac.
 
@@ -20,7 +21,7 @@ O modo padrão usa **telas independentes**. Não exige monitor específico, DDC 
 
 ## Como funciona
 
-O painel fica na barra de menus do Mac. O mesmo projeto fornece o serviço nativo do Windows. Sem conta, nuvem, NAS ou assinatura, e sem precisar manter outro aplicativo aberto. A webcam física só é capturada após o início manual do compartilhamento.
+O painel fica na barra de menus do Mac e na bandeja do Windows, com o mesmo símbolo e os mesmos recursos. Os dois aplicativos permitem pausar/retomar teclado e mouse, controlar webcam e cartão SD, e editar os ajustes compartilhados. No Mac, o X vermelho recolhe a janela e mantém a ponte ativa na barra de menus; clique em Abrir Ponte Desk para voltar ao painel. Encerrar Ponte Desk ou ⌘Q encerra o aplicativo, mesmo com uma operação pendente. No Windows, fechar a janela encerra o aplicativo; Recolher painel mantém o app na bandeja. Sem conta, nuvem, NAS ou assinatura, e sem precisar manter outro aplicativo aberto. A webcam física só é capturada após o início manual do compartilhamento.
 
 No aplicativo de chamada, escolha **Ponte Desk Camera**. No Mac, o componente assinado publica uma saída 1080p; a opção 720p reduz captura e rede, e o receptor adapta a imagem. O microfone continua sendo o escolhido localmente no aplicativo de chamada.
 
@@ -29,7 +30,7 @@ No aplicativo de chamada, escolha **Ponte Desk Camera**. No Mac, o componente as
 - macOS 14 ou posterior e Windows 11.
 - Mesma rede local; conexão por cabo é recomendada para vídeo.
 - Webcam USB externa para compartilhar câmera. Não há substituição automática pela câmera integrada.
-- Pareamento configurado nos dois lados. Esta versão oferece um par Mac–Windows; o painel atual está no Mac.
+- Pareamento configurado nos dois lados. Esta versão oferece um par Mac–Windows; há um aplicativo instalado em cada máquina.
 
 ## Compilar e instalar
 
@@ -41,18 +42,20 @@ No Mac, instale Rust estável e as ferramentas de linha de comando do Xcode:
 ./scripts/build-macos.sh
 ```
 
-O aplicativo é criado em `dist/Ponte Desk.app`. A assinatura local do aplicativo é ad hoc; o componente de câmera mantém a assinatura notarizada de seu fornecedor. Compilar não ativa extensões nem concede permissões.
+O aplicativo é criado em `dist/Ponte Desk.app`. A assinatura local do aplicativo é ad hoc; o componente de câmera mantém a assinatura notarizada de seu fornecedor. Compilar não ativa extensões nem concede permissões. Para publicar cartões pelo Mac, **Configurar…** abre o instalador do auxiliar incluído, que exige autorização administrativa normal do macOS.
 
 No Windows, use Rust com MSVC ou GNU/MinGW:
 
 ```powershell
 cargo build --release --no-default-features
 ./native/windows/webcam/build.ps1
+./native/windows/storage/build.ps1
+./native/windows/app/build.ps1
 ```
 
-A DLL de câmera requer MSVC x64 e Windows SDK 26100. Veja [instalação e pareamento](docs/setup.md), [opções](docs/options.md) e [componente da câmera](docs/camera-component.md). Depois do pareamento, o instalador `scripts/install-windows.ps1` registra a DLL uma vez e inicia o serviço em usuário comum.
+A interface Windows usa WinForms e o .NET Framework incluído no Windows 11, sem WebView ou outro aplicativo residente. A DLL de câmera requer MSVC x64 e Windows SDK 26100. Veja [instalação e pareamento](docs/setup.md), [opções](docs/options.md) e [componente da câmera](docs/camera-component.md). Depois do pareamento, o instalador `scripts/install-windows.ps1` registra a DLL uma vez e inicia o serviço em usuário comum.
 
-**Use a mesma versão nos dois computadores.** A versão 0.3 introduz opções autenticadas no protocolo de coordenação; atualize o par junto.
+**Use a mesma versão nos dois computadores.** A 0.6.0 adiciona periféricos fixos e coordenação v4; atualize as duas máquinas juntas. A 0.5.1 corrige o encerramento mesmo com operações pendentes. O controle dos ajustes pelos dois lados exige a versão 0.5. O armazenamento requer a versão 0.4 ou posterior nos dois lados. A versão 0.3 introduz opções autenticadas no protocolo de coordenação; atualize o par junto.
 
 ## Ajustes
 

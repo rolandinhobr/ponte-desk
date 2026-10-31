@@ -5,6 +5,7 @@ pub mod agent;
 #[cfg(target_os = "macos")]
 mod macos;
 mod native;
+mod probe;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -32,6 +33,8 @@ use std::{
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct Policy {
     pub capture: bool,
+    #[serde(default)]
+    pub direct: bool,
     pub emulation: bool,
     pub reason: String,
     pub expires_ms: u64,
@@ -41,6 +44,7 @@ impl Policy {
     fn local(reason: &str) -> Self {
         Self {
             capture: false,
+            direct: false,
             emulation: false,
             reason: reason.into(),
             expires_ms: 0,
@@ -73,6 +77,7 @@ pub(crate) struct Guard {
     coordinator: Option<native::Coordinator>,
     status_root: Option<PathBuf>,
     pub policy: Policy,
+    pub direct_active: bool,
     last_status: Instant,
     last_ignored_software: u64,
 }
@@ -99,6 +104,7 @@ impl Guard {
             Some(path) => read_policy(path, now_ms()),
             None => Policy {
                 capture: false,
+                direct: false,
                 emulation: false,
                 reason: "aguardando conexão integrada".into(),
                 expires_ms: 0,
@@ -109,6 +115,7 @@ impl Guard {
             coordinator,
             status_root,
             policy,
+            direct_active: false,
             last_status: Instant::now() - Duration::from_secs(6),
             last_ignored_software: 0,
         }
@@ -122,7 +129,8 @@ impl Guard {
         } else {
             return false;
         };
-        let changed = self.policy.capture != policy.capture
+        let changed = self.policy.direct != policy.direct
+            || self.policy.capture != policy.capture
             || self.policy.emulation != policy.emulation
             || self.policy.reason != policy.reason;
         self.policy = policy;
@@ -131,7 +139,7 @@ impl Guard {
 
     pub fn write_status(&mut self, capture: bool, emulation: bool, force: bool) {
         if let Some(coordinator) = self.coordinator.as_mut() {
-            coordinator.actual(capture, emulation);
+            coordinator.actual(capture, emulation, self.direct_active);
         }
         let Some(root) = self.status_root.as_ref() else {
             return;
@@ -147,9 +155,12 @@ impl Guard {
         self.last_status = Instant::now();
         let status = serde_json::json!({
             "timestamp_ms": now_ms(), "pid": std::process::id(),
-            "capture_installed": capture, "emulation_enabled": emulation,
+            "capture_installed": capture, "emulation_enabled": emulation, "direct_active": self.direct_active,
             "reason": self.policy.reason,
             "ignored_software_events": ignored,
+            "native_input": input_emulation::native_performance().map(|p| serde_json::json!({
+                "requests":p.requests,"max_native_us":p.max_native_us,"max_round_trip_us":p.max_round_trip_us
+            })),
         });
         {
             let parent = root;
@@ -178,7 +189,11 @@ pub(crate) fn monitor_catalog() -> serde_json::Value {
     {
         windows::monitor_catalog()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::monitor_catalog()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         serde_json::json!({"monitors":[]})
     }
