@@ -7,7 +7,7 @@ use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -148,6 +148,8 @@ impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
+        let mut button_serials = HashMap::<SocketAddr, u32>::new();
+        let mut button_sources = HashSet::new();
         let mut rejected_connections = HashMap::new();
         loop {
             select! {
@@ -162,6 +164,7 @@ impl ListenTask {
                                     continue;
                                 }
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    button_sources.insert(addr);
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -169,10 +172,27 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                // Retain the sequence tombstone: delayed state must
+                                // not recreate a held button after the route left.
+                                button_sources.remove(&addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
-                            ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
+                            ProtoEvent::ButtonSync => self.listener.reply(addr, ProtoEvent::ButtonSync).await,
+                            ProtoEvent::PointerButtons {serial,mask} => {
+                                let first=!button_serials.contains_key(&addr);
+                                if button_sources.contains(&addr) && self.emulation_proxy.emulation_active.get() && accept_button_snapshot(&mut button_serials,addr,serial,mask) {
+                                    if first {log::info!("receiving synchronized pointer button state from {addr}");}
+                                    self.emulation_proxy.sync_buttons(mask,addr);
+                                }
+                            }
+                            ProtoEvent::Input(event) => {
+                                // Once state sync starts, delayed legacy transitions must
+                                // not re-press a button released by a newer snapshot.
+                                if !button_serials.contains_key(&addr) || !matches!(event,Event::Pointer(PointerEvent::Button {button,..}) if (input_event::BTN_LEFT..=input_event::BTN_FORWARD).contains(&button)) {
+                                    self.emulation_proxy.consume(event, addr);
+                                }
+                            },
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
@@ -193,6 +213,8 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        button_serials.remove(&addr);
+                        button_sources.remove(&addr);
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
@@ -223,6 +245,8 @@ impl ListenTask {
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
+                            button_serials.remove(&addr);
+                            button_sources.remove(&addr);
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
@@ -251,6 +275,7 @@ pub(crate) struct EmulationProxy {
 #[derive(Debug, PartialEq)]
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    Buttons(u8, SocketAddr),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -298,6 +323,14 @@ impl EmulationProxy {
         if self.emulation_active.get() {
             self.request_tx
                 .send(ProxyRequest::Input(event, addr))
+                .expect("channel closed");
+        }
+    }
+
+    fn sync_buttons(&self, mask: u8, addr: SocketAddr) {
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::Buttons(mask, addr))
                 .expect("channel closed");
         }
     }
@@ -365,7 +398,8 @@ impl EmulationTask {
                         }
                     }
                     ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Input(..) | ProxyRequest::Buttons(..) => { /* emulation inactive => ignore */
+                    }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -433,6 +467,13 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
+                    ProxyRequest::Buttons(mask,addr) => {
+                        let handle=match self.handles.get(&addr) {
+                            Some(&h)=>h,
+                            None=>{let h=self.next_id;self.next_id+=1;emulation.create(h).await;self.handles.insert(addr,h);h}
+                        };
+                        emulation.sync_pointer_buttons(handle,mask).await?;
+                    }
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
@@ -448,6 +489,43 @@ impl EmulationTask {
                 },
             }
         }
+    }
+}
+
+fn accept_button_snapshot(
+    serials: &mut HashMap<SocketAddr, u32>,
+    addr: SocketAddr,
+    serial: u32,
+    mask: u8,
+) -> bool {
+    if mask & !31 != 0 {
+        return false;
+    }
+    if serials
+        .get(&addr)
+        .is_some_and(|previous| serial.wrapping_sub(*previous) as i32 <= 0)
+    {
+        return false;
+    }
+    serials.insert(addr, serial);
+    true
+}
+
+#[cfg(test)]
+mod button_snapshot_tests {
+    use super::*;
+    #[test]
+    fn duplicate_and_reordered_snapshots_cannot_repress_released_button() {
+        let addr = "127.0.0.1:4242".parse().unwrap();
+        let mut serials = HashMap::new();
+        assert!(accept_button_snapshot(&mut serials, addr, 41, 1));
+        assert!(accept_button_snapshot(&mut serials, addr, 43, 0)); // release 42 was lost
+        assert!(!accept_button_snapshot(&mut serials, addr, 41, 1));
+        assert!(!accept_button_snapshot(&mut serials, addr, 43, 0));
+        assert!(!accept_button_snapshot(&mut serials, addr, 44, 128));
+        let other = "127.0.0.2:4242".parse().unwrap();
+        assert!(accept_button_snapshot(&mut serials, other, u32::MAX, 1));
+        assert!(accept_button_snapshot(&mut serials, other, 0, 0));
     }
 }
 
@@ -518,7 +596,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Input(_, _) | ProxyRequest::Buttons(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
             ProxyRequest::Suspend(_) => continue,

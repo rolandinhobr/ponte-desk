@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -9,7 +9,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -88,6 +88,9 @@ impl Capture {
             active_client: None,
             direct: false,
             pending_direct: VecDeque::new(),
+            button_sync_clients: HashSet::new(),
+            button_serial: crate::integration::now_ms() as u32,
+            button_mask: 0,
             waiting_since: None,
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -185,6 +188,9 @@ macro_rules! debounce {
 struct CaptureTask {
     direct: bool,
     pending_direct: VecDeque<Event>,
+    button_sync_clients: HashSet<CaptureHandle>,
+    button_serial: u32,
+    button_mask: u8,
     waiting_since: Option<Instant>,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
@@ -323,13 +329,36 @@ impl CaptureTask {
         }
     }
 
+    async fn send_input(
+        &mut self,
+        event: Event,
+        handle: CaptureHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        let event = button_wire_event(
+            event,
+            self.button_sync_clients.contains(&handle),
+            &mut self.button_serial,
+            &mut self.button_mask,
+        );
+        self.conn.send(event, handle).await
+    }
+
     async fn do_capture_session(
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
         let mut handshake = tokio::time::interval(Duration::from_millis(250));
+        let mut buttons = tokio::time::interval(Duration::from_millis(100));
+        buttons.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _=buttons.tick(), if self.active_client.is_some() && self.state == State::Sending => {
+                    let handle=self.active_client.unwrap();
+                    let event=if self.button_sync_clients.contains(&handle) {
+                        ProtoEvent::PointerButtons {serial:self.button_serial,mask:self.button_mask}
+                    } else { ProtoEvent::ButtonSync };
+                    if self.conn.send(event,handle).await.is_err(){self.pause_direct();self.release_capture(capture).await?;}
+                },
                 _=handshake.tick(), if self.direct && self.waiting_since.is_some()=>{
                     if self.waiting_since.is_some_and(|t|t.elapsed()>Duration::from_secs(2)) {
                         self.pause_direct();self.release_capture(capture).await?;
@@ -351,12 +380,13 @@ impl CaptureTask {
                     }
 
                     match event {
+                        ProtoEvent::ButtonSync => { if self.button_sync_clients.insert(handle) { log::info!("pointer button state synchronization enabled for client {handle}"); } }
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;self.waiting_since=None;
                             while let Some(event)=self.pending_direct.pop_front(){
-                                if self.conn.send(ProtoEvent::Input(event),handle).await.is_err(){self.pause_direct();self.release_capture(capture).await?;break;}
+                                if self.send_input(event,handle).await.is_err(){self.pause_direct();self.release_capture(capture).await?;break;}
                             }
                         }
                         // client disconnected
@@ -468,7 +498,11 @@ impl CaptureTask {
             },
         };
 
-        if let Err(e) = self.conn.send(event, handle).await {
+        let result = match event {
+            ProtoEvent::Input(e) => self.send_input(e, handle).await,
+            e => self.conn.send(e, handle).await,
+        };
+        if let Err(e) = result {
             if self.direct
                 && self.state == State::WaitingForAck
                 && matches!(
@@ -500,6 +534,20 @@ impl CaptureTask {
         }
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            self.button_mask = 0;
+            self.button_serial = self.button_serial.wrapping_add(1);
+            if self.button_sync_clients.contains(&handle) {
+                let _ = self
+                    .conn
+                    .send(
+                        ProtoEvent::PointerButtons {
+                            serial: self.button_serial,
+                            mask: 0,
+                        },
+                        handle,
+                    )
+                    .await;
+            }
             // Surface the leave to the service layer so it can fire
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer
@@ -560,6 +608,69 @@ enum State {
     #[default]
     WaitingForAck,
     Sending,
+}
+
+fn button_wire_event(event: Event, supported: bool, serial: &mut u32, mask: &mut u8) -> ProtoEvent {
+    if let Event::Pointer(PointerEvent::Button { button, state, .. }) = event {
+        if let Some(index) = button.checked_sub(input_event::BTN_LEFT).filter(|i| *i < 5) {
+            let next = if state == 1 {
+                *mask | (1 << index)
+            } else {
+                *mask & !(1 << index)
+            };
+            if next != *mask {
+                *mask = next;
+                *serial = serial.wrapping_add(1);
+            }
+            if supported {
+                return ProtoEvent::PointerButtons {
+                    serial: *serial,
+                    mask: *mask,
+                };
+            }
+        }
+    }
+    ProtoEvent::Input(event)
+}
+#[cfg(test)]
+mod button_wire_tests {
+    use super::*;
+    fn button(state: u32) -> Event {
+        Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: input_event::BTN_LEFT,
+            state,
+        })
+    }
+    #[test]
+    fn negotiated_full_state_preserves_legacy_and_ignores_duplicate_transitions() {
+        let (mut serial, mut mask) = (40, 0);
+        assert!(matches!(
+            button_wire_event(button(1), false, &mut serial, &mut mask),
+            ProtoEvent::Input(_)
+        ));
+        assert!(matches!(
+            button_wire_event(button(1), true, &mut serial, &mut mask),
+            ProtoEvent::PointerButtons {
+                serial: 41,
+                mask: 1
+            }
+        ));
+        assert!(matches!(
+            button_wire_event(button(0), true, &mut serial, &mut mask),
+            ProtoEvent::PointerButtons {
+                serial: 42,
+                mask: 0
+            }
+        ));
+        assert!(matches!(
+            button_wire_event(button(0), true, &mut serial, &mut mask),
+            ProtoEvent::PointerButtons {
+                serial: 42,
+                mask: 0
+            }
+        ));
+    }
 }
 
 fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {

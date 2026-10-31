@@ -16,7 +16,7 @@ use input_event::{
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -34,16 +34,46 @@ pub(crate) struct MacOSEmulation {
     repeat_task: Option<JoinHandle<()>>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
-    /// button previously pressed (evdev button code)
-    previous_button: Option<u32>,
-    /// timestamp of previous click (button down)
-    previous_button_click: Option<Instant>,
-    /// click state, i.e. number of clicks in quick succession
-    button_click_state: i64,
+    clicks: ClickTracker,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
     /// Persistent cancellation for this key only, including before first poll.
     repeat_cancel: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+struct ClickTracker {
+    previous: Option<(u32, CGPoint, Instant, i64)>,
+    held: HashMap<u32, i64>,
+}
+impl ClickTracker {
+    fn moved(&mut self, position: CGPoint) {
+        if self.previous.is_some_and(|(_, p, _, _)| {
+            (p.x - position.x).abs() > 4. || (p.y - position.y).abs() > 4.
+        }) {
+            self.previous = None;
+        }
+    }
+    fn transition(&mut self, button: u32, state: u32, position: CGPoint, now: Instant) -> i64 {
+        if state == 0 {
+            return self.held.remove(&button).unwrap_or(1);
+        }
+        if let Some(count) = self.held.get(&button) {
+            return *count;
+        }
+        let count = self
+            .previous
+            .filter(|(b, p, t, _)| {
+                *b == button
+                    && now.duration_since(*t) < DOUBLE_CLICK_INTERVAL
+                    && (p.x - position.x).abs() <= 4.
+                    && (p.y - position.y).abs() <= 4.
+            })
+            .map_or(1, |(_, _, _, n)| n.saturating_add(1));
+        self.previous = Some((button, position, now, count));
+        self.held.insert(button, count);
+        count
+    }
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -79,9 +109,7 @@ impl MacOSEmulation {
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
-            previous_button: None,
-            previous_button_click: None,
-            button_click_state: 0,
+            clicks: ClickTracker::default(),
             repeat_task: None,
             repeat_cancel: None,
             modifier_state: Rc::new(Cell::new(XMods::empty())),
@@ -333,14 +361,20 @@ impl Emulation for MacOSEmulation {
                         let event_type = self
                             .pressed_buttons
                             .iter()
-                            .next()
+                            .min()
                             .map(|&btn| drag_event_type(btn))
                             .unwrap_or(CGEventType::MouseMoved);
+                        self.clicks.moved(mouse_location);
+                        let mouse_button = match event_type {
+                            CGEventType::RightMouseDragged => CGMouseButton::Right,
+                            CGEventType::OtherMouseDragged => CGMouseButton::Center,
+                            _ => CGMouseButton::Left,
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
                             mouse_location,
-                            CGMouseButton::Left,
+                            mouse_button,
                         ) {
                             Ok(e) => e,
                             Err(_) => {
@@ -389,24 +423,12 @@ impl Emulation for MacOSEmulation {
                             self.pressed_buttons.remove(&button);
                         }
 
-                        // update double-click tracking using the evdev button
-                        // code so that back/forward don't alias with middle
-                        if state == 1 {
-                            if self.previous_button == Some(button)
-                                && self
-                                    .previous_button_click
-                                    .is_some_and(|i| i.elapsed() < DOUBLE_CLICK_INTERVAL)
-                            {
-                                self.button_click_state += 1;
-                            } else {
-                                self.button_click_state = 1;
-                            }
-                            self.previous_button = Some(button);
-                            self.previous_button_click = Some(Instant::now());
-                        }
-
-                        log::debug!("click_state: {}", self.button_click_state);
-                        let location = self.get_mouse_location().unwrap();
+                        let Some(location) = self.get_mouse_location() else {
+                            return Ok(());
+                        };
+                        let click_state =
+                            self.clicks
+                                .transition(button, state, location, Instant::now());
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
@@ -421,7 +443,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(
                             EventField::MOUSE_EVENT_CLICK_STATE,
-                            self.button_click_state,
+                            click_state,
                         );
                         // Set the button number for extra buttons (back=3, forward=4)
                         if let Some(btn_num) = cg_button_number {
@@ -484,11 +506,6 @@ impl Emulation for MacOSEmulation {
                         };
                         event.post(CGEventTapLocation::HID);
                     }
-                }
-
-                // reset button click state in case it's not a button event
-                if !matches!(pointer_event, PointerEvent::Button { .. }) {
-                    self.button_click_state = 0;
                 }
             }
             Event::Keyboard(keyboard_event) => match keyboard_event {
@@ -786,5 +803,60 @@ mod repeat_cancellation_tests {
         )
         .await;
         assert_eq!(states, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod click_tracking_tests {
+    use super::*;
+    #[test]
+    fn click_release_keeps_count_during_motion_and_double_click_requires_proximity() {
+        let mut clicks = ClickTracker::default();
+        let now = Instant::now();
+        let p = CGPoint::new(10., 10.);
+        assert_eq!(clicks.transition(BTN_LEFT, 1, p, now), 1);
+        clicks.moved(CGPoint::new(11., 10.));
+        assert_eq!(clicks.transition(BTN_LEFT, 0, p, now), 1);
+        assert_eq!(
+            clicks.transition(BTN_LEFT, 1, p, now + Duration::from_millis(100)),
+            2
+        );
+        clicks.moved(CGPoint::new(300., 200.));
+        assert_eq!(
+            clicks.transition(BTN_LEFT, 0, CGPoint::new(300., 200.), now),
+            2
+        );
+        assert_eq!(
+            clicks.transition(
+                BTN_LEFT,
+                1,
+                CGPoint::new(300., 200.),
+                now + Duration::from_millis(200)
+            ),
+            1
+        );
+    }
+    #[test]
+    fn rapid_clicks_at_different_locations_and_duplicate_down_are_single_clicks() {
+        let mut c = ClickTracker::default();
+        let now = Instant::now();
+        let p = CGPoint::new(1., 1.);
+        assert_eq!(c.transition(BTN_LEFT, 1, p, now), 1);
+        assert_eq!(c.transition(BTN_LEFT, 1, p, now), 1);
+        assert_eq!(c.transition(BTN_LEFT, 0, p, now), 1);
+        assert_eq!(
+            c.transition(
+                BTN_LEFT,
+                1,
+                CGPoint::new(200., 200.),
+                now + Duration::from_millis(10)
+            ),
+            1
+        );
+        assert_eq!(
+            c.transition(BTN_RIGHT, 1, p, now + Duration::from_millis(20)),
+            1
+        );
+        assert_eq!(c.transition(BTN_LEFT, 0, p, now), 1);
     }
 }

@@ -165,14 +165,18 @@ impl InputEmulation {
     ) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(PointerEvent::Button { button, state, .. }) => {
-                if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
-                    if state == 0 {
-                        buttons.remove(&button);
-                    } else {
-                        buttons.insert(button);
-                    }
+                let Some(buttons) = self.pressed_buttons.get_mut(&handle) else {
+                    return Ok(());
+                };
+                let changed = match state {
+                    0 => buttons.remove(&button),
+                    1 => buttons.insert(button),
+                    _ => false,
+                };
+                if changed {
+                    self.emulation.consume(event, handle).await?;
                 }
-                self.emulation.consume(event, handle).await
+                Ok(())
             }
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // prevent double pressed / released keys
@@ -183,6 +187,32 @@ impl InputEmulation {
             }
             _ => self.emulation.consume(event, handle).await,
         }
+    }
+
+    /// Reconcile the complete remote state. Repeated snapshots emit no input;
+    /// a later snapshot repairs a lost button-up without timing out long drags.
+    pub async fn sync_pointer_buttons(
+        &mut self,
+        handle: EmulationHandle,
+        mask: u8,
+    ) -> Result<(), EmulationError> {
+        for state in [0, 1] {
+            for index in 0..5 {
+                let desired = u32::from(mask & (1 << index) != 0);
+                if desired == state {
+                    self.consume(
+                        Event::Pointer(PointerEvent::Button {
+                            time: 0,
+                            button: input_event::BTN_LEFT + index,
+                            state,
+                        }),
+                        handle,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
@@ -305,6 +335,65 @@ mod lifecycle_tests {
         async fn create(&mut self, _: EmulationHandle) {}
         async fn destroy(&mut self, _: EmulationHandle) {}
         async fn terminate(&mut self) {}
+    }
+    #[tokio::test]
+    async fn repeated_button_down_is_not_a_second_click() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut input = InputEmulation {
+            emulation: Box::new(Recorder(events.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        };
+        input.create(0).await;
+        for state in [1, 1, 0, 0] {
+            input
+                .consume(
+                    Event::Pointer(PointerEvent::Button {
+                        time: 0,
+                        button: input_event::BTN_LEFT,
+                        state,
+                    }),
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            events.lock().unwrap().len(),
+            2,
+            "duplicate button transitions must not reach the OS"
+        );
+    }
+    #[tokio::test]
+    async fn snapshots_repair_lost_release_and_preserve_long_drags() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut input = InputEmulation {
+            emulation: Box::new(Recorder(events.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            pressed_buttons: HashMap::new(),
+        };
+        input.create(0).await;
+        input.sync_pointer_buttons(0, 1).await.unwrap();
+        for _ in 0..1000 {
+            input.sync_pointer_buttons(0, 1).await.unwrap();
+        }
+        assert_eq!(
+            events.lock().unwrap().len(),
+            1,
+            "a held drag must not be released or repeated"
+        );
+        // The transition packet was lost; its next periodic state is sufficient.
+        input.sync_pointer_buttons(0, 0).await.unwrap();
+        input.sync_pointer_buttons(0, 0).await.unwrap();
+        assert_eq!(events.lock().unwrap().len(), 2);
+        assert!(input.pressed_buttons[&0].is_empty());
+        // Every button is independent, including back/forward.
+        input.sync_pointer_buttons(0, 0b11111).await.unwrap();
+        input.sync_pointer_buttons(0, 0b11010).await.unwrap();
+        assert_eq!(input.pressed_buttons[&0].len(), 3);
+        input.terminate().await;
     }
     #[tokio::test]
     async fn suspension_cleanup_releases_drag_and_modifier_before_destroy() {
