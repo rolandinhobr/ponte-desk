@@ -293,6 +293,25 @@ pub fn choose_policy(
     }
 }
 
+#[derive(Clone)]
+struct LocalFiles {
+    #[cfg(not(windows))]
+    preferences: crate::preferences::Preferences,
+    agent: bool,
+    manual_pause: bool,
+}
+impl LocalFiles {
+    fn read(root: &Path) -> Self {
+        Self {
+            #[cfg(not(windows))]
+            preferences: crate::preferences::Preferences::load(root),
+            agent: lease_active(root),
+            manual_pause: root.join("manual-pause").exists()
+                || !crate::preferences::Preferences::valid_file(root),
+        }
+    }
+}
+
 pub struct Coordinator {
     pub root: PathBuf,
     pub local: State,
@@ -305,6 +324,8 @@ pub struct Coordinator {
     last_probe: Instant,
     platform_probe: super::probe::BackgroundProbe<PlatformState>,
     platform_ready: bool,
+    files_probe: super::probe::BackgroundProbe<LocalFiles>,
+    status_writer: super::probe::BackgroundWriter<(PathBuf, serde_json::Value)>,
     last_send: Instant,
     last_status: Instant,
     candidate: Policy,
@@ -324,6 +345,16 @@ impl Coordinator {
         fs::create_dir_all(root.join("agent-leases"))?;
         let old = Instant::now() - Duration::from_secs(60);
         let options = crate::preferences::Preferences::load(&root);
+        let files_root = root.clone();
+        let files_probe = super::probe::BackgroundProbe::named("coordinator-files", move || {
+            LocalFiles::read(&files_root)
+        })?;
+        let status_writer = super::probe::BackgroundWriter::new(
+            "coordinator-status",
+            |(path, value): (PathBuf, serde_json::Value)| {
+                let _ = atomic_json(&path, &value);
+            },
+        )?;
         Ok(Self {
             root,
             local: State {
@@ -340,6 +371,8 @@ impl Coordinator {
             last_probe: old,
             platform_probe: super::probe::BackgroundProbe::new(super::platform_probe)?,
             platform_ready: false,
+            files_probe,
+            status_writer,
             last_send: old,
             last_status: old,
             candidate: Policy::local("iniciando"),
@@ -371,11 +404,17 @@ impl Coordinator {
                 super::windows::request_refresh();
             }
         }
+        // Lease and settings reads may stall under file-sync/antivirus load.
+        // Sample off the input executor. Missing/old protection state fails
+        // closed and cannot keep input enabled using stale protection state.
+        let files = self.files_probe.poll(Duration::from_secs(2));
+        #[cfg(not(windows))]
+        if let Some(files) = files.as_ref() {
+            self.local.preferences = Some(files.preferences.clone());
+        }
+        self.local.agent = files.as_ref().is_none_or(|f| f.agent);
+        self.local.manual_pause = files.as_ref().is_none_or(|f| f.manual_pause);
         if self.last_probe.elapsed() >= Duration::from_millis(500) {
-            #[cfg(not(windows))]
-            {
-                self.local.preferences = Some(crate::preferences::Preferences::load(&self.root));
-            }
             // Fixed peripherals do not depend on displays or foreground apps.
             // In edge mode an OS query runs on its own bounded worker instead
             // of stopping network reception and native input on this executor.
@@ -394,9 +433,6 @@ impl Coordinator {
             }
             self.last_probe = Instant::now();
         }
-        self.local.agent = lease_active(&self.root);
-        self.local.manual_pause = self.root.join("manual-pause").exists()
-            || !crate::preferences::Preferences::valid_file(&self.root);
         let candidate = if !self.platform_ready {
             Policy::local("metadados do sistema indisponíveis: controle local")
         } else {
@@ -448,7 +484,9 @@ impl Coordinator {
                 "input":{"mode":self.local.preferences.as_ref().map(|p|p.input_mode.as_str()),"target_local":self.local.preferences.as_ref().is_some_and(|p|(p.input_mode=="to_mac"&&self.config.side=="mac")||(p.input_mode=="to_pc"&&self.config.side=="pc"))},
                 "policy":[self.applied.capture,self.applied.emulation,self.applied.reason],
                 "display":{"automatic":self.local.preferences.as_ref().is_some_and(|p|p.manage_displays && p.shared_monitor && p.input_mode == "edges"),"input":pc.and_then(|p|p.platform.input),"input_age_ms":pc.and_then(|p|p.platform.input_age_ms),"peer_fresh":self.peer_seen.elapsed()<Duration::from_secs(6),"mac_input":self.local.preferences.as_ref().map_or(0,|p|p.mac_input),"pc_input":self.local.preferences.as_ref().map_or(0,|p|p.pc_input)}});
-            let _ = atomic_json(&self.root.join("observer-status.json"), &status);
+            let _ = self
+                .status_writer
+                .submit((self.root.join("observer-status.json"), status));
             self.last_status = Instant::now();
         }
         self.applied.clone()

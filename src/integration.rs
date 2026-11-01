@@ -80,6 +80,8 @@ pub(crate) struct Guard {
     pub direct_active: bool,
     last_status: Instant,
     last_ignored_software: u64,
+    status_writer: probe::BackgroundWriter<(PathBuf, serde_json::Value)>,
+    status_pending: bool,
 }
 
 impl Guard {
@@ -118,6 +120,14 @@ impl Guard {
             direct_active: false,
             last_status: Instant::now() - Duration::from_secs(6),
             last_ignored_software: 0,
+            status_writer: probe::BackgroundWriter::new(
+                "engine-status",
+                |(root, status): (PathBuf, serde_json::Value)| {
+                    let _ = native::atomic_json(&root.join("engine-status.json"), &status);
+                },
+            )
+            .expect("status worker"),
+            status_pending: true,
         }
     }
 
@@ -146,13 +156,12 @@ impl Guard {
         };
         let ignored = input_capture::input_origin::ignored_software_events();
         if !force
+            && !self.status_pending
             && ignored == self.last_ignored_software
             && self.last_status.elapsed() < Duration::from_secs(5)
         {
             return;
         }
-        self.last_ignored_software = ignored;
-        self.last_status = Instant::now();
         let status = serde_json::json!({
             "timestamp_ms": now_ms(), "pid": std::process::id(),
             "capture_installed": capture, "emulation_enabled": emulation, "direct_active": self.direct_active,
@@ -162,14 +171,10 @@ impl Guard {
                 "requests":p.requests,"max_native_us":p.max_native_us,"max_round_trip_us":p.max_round_trip_us
             })),
         });
-        {
-            let parent = root;
-            let tmp = parent.join("engine-status.json.tmp");
-            if let Ok(data) = serde_json::to_vec(&status) {
-                if fs::write(&tmp, data).is_ok() {
-                    let _ = fs::rename(tmp, parent.join("engine-status.json"));
-                }
-            }
+        self.status_pending = !self.status_writer.submit((root.clone(), status));
+        if !self.status_pending {
+            self.last_ignored_software = ignored;
+            self.last_status = Instant::now();
         }
     }
 }

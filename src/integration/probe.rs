@@ -13,20 +13,25 @@ pub(super) struct BackgroundProbe<T> {
 }
 
 impl<T: Clone + Send + 'static> BackgroundProbe<T> {
-    pub fn new(mut probe: impl FnMut() -> T + Send + 'static) -> std::io::Result<Self> {
+    pub fn new(probe: impl FnMut() -> T + Send + 'static) -> std::io::Result<Self> {
+        Self::named("desktop-metadata", probe)
+    }
+
+    pub fn named(
+        name: &str,
+        mut probe: impl FnMut() -> T + Send + 'static,
+    ) -> std::io::Result<Self> {
         let (request, requests) = sync_channel(1);
         let (results, result) = sync_channel(1);
-        thread::Builder::new()
-            .name("desktop-metadata".into())
-            .spawn(move || {
-                while requests.recv().is_ok() {
-                    // Age includes time spent inside a stalled OS call.
-                    let started = Instant::now();
-                    if results.send((started, probe())).is_err() {
-                        break;
-                    }
+        thread::Builder::new().name(name.into()).spawn(move || {
+            while requests.recv().is_ok() {
+                // Age includes time spent inside a stalled OS call.
+                let started = Instant::now();
+                if results.send((started, probe())).is_err() {
+                    break;
                 }
-            })?;
+            }
+        })?;
         Ok(Self {
             request,
             result,
@@ -48,6 +53,25 @@ impl<T: Clone + Send + 'static> BackgroundProbe<T> {
             .as_ref()
             .filter(|(at, _)| at.elapsed() < max_age)
             .map(|(_, value)| value.clone())
+    }
+}
+
+// Keep status publication off input, with bounded work and no blocking send.
+pub(super) struct BackgroundWriter<T> {
+    request: SyncSender<T>,
+}
+impl<T: Send + 'static> BackgroundWriter<T> {
+    pub fn new(name: &str, mut write: impl FnMut(T) + Send + 'static) -> std::io::Result<Self> {
+        let (request, values) = sync_channel(1);
+        thread::Builder::new().name(name.into()).spawn(move || {
+            while let Ok(value) = values.recv() {
+                write(value);
+            }
+        })?;
+        Ok(Self { request })
+    }
+    pub fn submit(&self, value: T) -> bool {
+        self.request.try_send(value).is_ok()
     }
 }
 
@@ -75,6 +99,28 @@ mod tests {
         assert!(entered_rx.try_recv().is_err());
         release_tx.send(()).unwrap();
         // Drop receivers without joining a worker potentially blocked in the OS.
+    }
+
+    #[test]
+    fn blocked_status_write_does_not_block_input_or_grow_a_backlog() {
+        let (entered, waiting) = sync_channel(1);
+        let (release, blocked) = sync_channel::<()>(1);
+        let writer = BackgroundWriter::new("test-status", move |_: u8| {
+            let _ = entered.send(());
+            let _ = blocked.recv();
+        })
+        .unwrap();
+        assert!(writer.submit(1));
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(writer.submit(2));
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            assert!(!writer.submit(3));
+        }
+        assert!(start.elapsed() < Duration::from_millis(250));
+        release.send(()).unwrap();
+        // Disconnection releases the fake writer's second call as well.
+        drop(release);
     }
 
     #[test]
