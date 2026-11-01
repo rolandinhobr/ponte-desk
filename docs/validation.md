@@ -67,3 +67,8 @@ O teste `tests/coordinator_stall.py` usa um diretório temporário, backends dum
 
 
 A versão final passou em 54 testes de biblioteca no Mac e 45 no Windows, Clippy e builds release nativos nos dois sistemas. No teste de I/O bloqueado, IPC respondeu em 16,6 ms e SIGINT encerrou em 3,9 ms. O smoke de coordenação passou com pausa manual, tela cheia, destinos fixos, agente no destino, isolamento de agente na origem e expiração do par. A atualização ainda requer verificação física após instalação; esses números não medem latência visual em uma rede saturada.
+
+
+Após a confirmação nativa do usuário, Acessibilidade e Monitoração de Entrada foram renovadas para a versão instalada, com Encerrar e Reabrir aplicado. Os estados atuais confirmaram captura direta no Windows e emulação no Mac em `to_mac`. A validação física após essa atualização permanece pendente: a amostra observada não continha entrada nativa recebida.
+
+O teste de transporte após a renovação registrou 120 Ping/Pong DTLS pareados, média 0,912 ms, p95 1,089 ms e máximo 4,056 ms. Duas transferências temporárias em memória, limitadas a dez segundos e sem gravar o payload em disco, alcançaram 873 Mbit/s Mac → PC e 949 Mbit/s PC → Mac. Durante a primeira carga, 120 Ping/Pong tiveram média 1,933 ms, p95 4,632 ms e máximo 4,733 ms; na segunda, 60 tiveram média 2,592 ms, p95 4,477 ms e máximo 4,510 ms. Cada amostra inclui também intervalos sem a transferência. Os listeners de teste encerraram ao concluir. Não houve alteração de regras de firewall. Esses testes não reproduzem o processamento de arquivos/SMB de uma cópia para NAS, nem medem o cursor físico durante edição; a eliminação do lag nesse fluxo ainda precisa dessa confirmação.
