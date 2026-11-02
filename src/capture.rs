@@ -334,12 +334,31 @@ impl CaptureTask {
         event: Event,
         handle: CaptureHandle,
     ) -> Result<(), LanMouseConnectionError> {
+        let previous_serial = self.button_serial;
         let event = button_wire_event(
             event,
             self.button_sync_clients.contains(&handle),
             &mut self.button_serial,
             &mut self.button_mask,
         );
+        match event {
+            ProtoEvent::PointerButtons { serial, mask } if serial != previous_serial => {
+                input_event::button_diagnostics::snapshot_event(
+                    input_event::button_diagnostics::Stage::Send,
+                    serial,
+                    mask,
+                );
+            }
+            ProtoEvent::Input(Event::Pointer(PointerEvent::Button { button, state, .. })) => {
+                input_event::button_diagnostics::transition(
+                    input_event::button_diagnostics::Stage::Send,
+                    button,
+                    state,
+                    None,
+                );
+            }
+            _ => {}
+        }
         self.conn.send(event, handle).await
     }
 
@@ -536,6 +555,11 @@ impl CaptureTask {
         if let Some(handle) = self.active_client.take() {
             self.button_mask = 0;
             self.button_serial = self.button_serial.wrapping_add(1);
+            input_event::button_diagnostics::snapshot_event(
+                input_event::button_diagnostics::Stage::Cleanup,
+                self.button_serial,
+                0,
+            );
             if self.button_sync_clients.contains(&handle) {
                 let _ = self
                     .conn

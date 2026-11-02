@@ -69,6 +69,12 @@ impl Stream for WindowsInputCapture {
                     ..
                 })) = event
                 {
+                    input_event::button_diagnostics::transition(
+                        input_event::button_diagnostics::Stage::Captured,
+                        button,
+                        state,
+                        None,
+                    );
                     if let Some(index) = button.checked_sub(BTN_LEFT).filter(|i| *i < 5) {
                         self.delivered_buttons[index as usize] =
                             if state == 1 { Some(pos) } else { None };
@@ -97,6 +103,12 @@ fn repair_release(
     for (index, slot) in delivered.iter_mut().enumerate() {
         if physical & (1 << index) == 0 {
             if let Some(pos) = slot.take() {
+                input_event::button_diagnostics::transition(
+                    input_event::button_diagnostics::Stage::Repair,
+                    BTN_LEFT + index as u32,
+                    0,
+                    None,
+                );
                 return Some((
                     pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Button {

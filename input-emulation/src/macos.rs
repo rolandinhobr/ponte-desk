@@ -452,6 +452,12 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
+                        input_event::button_diagnostics::transition(
+                            input_event::button_diagnostics::Stage::Posted,
+                            button,
+                            state,
+                            Some(click_state),
+                        );
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Axis {

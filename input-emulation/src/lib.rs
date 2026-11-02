@@ -173,6 +173,18 @@ impl InputEmulation {
                     1 => buttons.insert(button),
                     _ => false,
                 };
+                if changed || state == 1 {
+                    input_event::button_diagnostics::transition(
+                        if changed {
+                            input_event::button_diagnostics::Stage::Emulated
+                        } else {
+                            input_event::button_diagnostics::Stage::Suppressed
+                        },
+                        button,
+                        state,
+                        None,
+                    );
+                }
                 if changed {
                     self.emulation.consume(event, handle).await?;
                 }
@@ -245,6 +257,12 @@ impl InputEmulation {
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
         if let Some(buttons) = self.pressed_buttons.get_mut(&handle) {
             for button in buttons.drain().collect::<Vec<_>>() {
+                input_event::button_diagnostics::transition(
+                    input_event::button_diagnostics::Stage::Cleanup,
+                    button,
+                    0,
+                    None,
+                );
                 self.emulation
                     .consume(
                         Event::Pointer(PointerEvent::Button {

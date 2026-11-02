@@ -88,6 +88,8 @@ python3 tests/coordinator_smoke.py target/release/ponte-desk
 
 O smoke test usa backends dummy e estado autenticado de loopback, sem enviar entrada real. O diagnóstico `examples/kvm_link_probe.rs` testa o transporte pareado com Ping/Pong, sem teclas, cliques ou movimento. [Arquitetura](docs/architecture.md) · [Validação](docs/validation.md) · [Contribuir](CONTRIBUTING.md).
 
+O [diagnóstico local de cliques](docs/button-diagnostics.md) conserva um histórico limitado apenas de botões, sem teclas ou posições, para investigar falhas intermitentes.
+
 ## Créditos e licença
 
 Ponte Desk deriva do código do Lan Mouse e preserva seus autores, licença e histórico upstream. Componentes reutilizados mantêm os avisos e as licenças correspondentes. [Licença](LICENSE) · [Créditos](NOTICE) · [Documentação upstream](README-UPSTREAM.md).

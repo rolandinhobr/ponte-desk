@@ -181,6 +181,7 @@ impl ListenTask {
                                 let first=!peers.button_serials.contains_key(&addr);
                                 if self.emulation_proxy.emulation_active.get() && peers.accept_buttons(addr,serial,mask) {
                                     if first {log::info!("receiving synchronized pointer button state from {addr}");}
+                                    input_event::button_diagnostics::snapshot_event(input_event::button_diagnostics::Stage::Receive, serial, mask);
                                     self.emulation_proxy.sync_buttons(mask,addr);
                                 }
                             }

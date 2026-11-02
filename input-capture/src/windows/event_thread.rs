@@ -170,6 +170,12 @@ fn try_send_event(
 thread_local! {static PHYSICAL_BUTTONS:RefCell<Option<Arc<AtomicU32>>>=const{RefCell::new(None)};}
 fn record_physical_button(event: Option<PointerEvent>) {
     if let Some(PointerEvent::Button { button, state, .. }) = event {
+        input_event::button_diagnostics::transition(
+            input_event::button_diagnostics::Stage::Physical,
+            button,
+            state,
+            None,
+        );
         if let Some(index) = button.checked_sub(BTN_LEFT).filter(|i| *i < 5) {
             PHYSICAL_BUTTONS.with_borrow(|shared| {
                 if let Some(shared) = shared {
