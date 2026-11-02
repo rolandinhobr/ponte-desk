@@ -75,3 +75,6 @@ O teste de transporte após a renovação registrou 120 Ping/Pong DTLS pareados,
 
 
 Na validação física posterior, o usuário confirmou mouse e teclado PC → Mac, incluindo clique e scroll, normais inclusive durante a transferência solicitada para NAS ou PC. O snapshot após a confirmação registrou 7.021 requisições de entrada nativa, emulação ativa no Mac, captura direta ativa no Windows, par recente e sincronização de botões negociada. O máximo interno acumulado foi de 31,068 ms na chamada nativa e 31,111 ms na ida/volta ao worker; esses valores não são uma medição visual do cursor. O cenário de transferência testado ficou normal segundo o usuário, sem extrapolar essa confirmação para toda carga ou uso prolongado.
+
+
+Ainda em 01/11, o usuário relatou nova ocorrência de clique simples interpretado como duplo e informou que ela cessou espontaneamente antes da observação. Não houve reinício da ponte, alteração de permissões ou instalação de outro binário nessa investigação. Os dois motores permaneciam ativos e havia apenas um motor por máquina. A observação passiva temporária, restrita a botões nos dois lados, terminou sem eventos de botão no intervalo; portanto não reproduziu nem localizou a duplicação. A causa dessa recorrência continua em aberto. O teste normal durante transferência registrado acima não encerra essa falha intermitente.
