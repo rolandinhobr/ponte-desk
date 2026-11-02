@@ -30,6 +30,8 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
+    /// Read the real session cursor, including moves from local devices/agents.
+    cursor_source: CGEventSource,
     /// task handle for key repeats
     repeat_task: Option<JoinHandle<()>>,
     /// current state of the mouse buttons (tracked by evdev button code)
@@ -76,6 +78,64 @@ impl ClickTracker {
     }
 }
 
+fn new_posting_source() -> Result<CGEventSource, ()> {
+    // Other software can leave aggregate flags behind (e.g. a Cmd+V paste).
+    // Never let that shared state become the bridge's own input state.
+    CGEventSource::new(CGEventSourceStateID::Private)
+}
+
+#[derive(Default)]
+struct LocalPointerModifiers {
+    shift: bool,
+    control: bool,
+    option: bool,
+    command: bool,
+    function: bool,
+    caps_lock: bool,
+}
+
+impl LocalPointerModifiers {
+    fn sample() -> Self {
+        // Inspect actual modifier key states, not aggregate modifier flags:
+        // the latter can contain an orphan Cmd even in HIDSystemState.
+        Self::from_keys(
+            |key| unsafe { CGEventSourceKeyState(CGEventSourceStateID::HIDSystemState, key) },
+            unsafe { CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState) }
+                & CGEventFlags::CGEventFlagAlphaShift.bits()
+                != 0,
+        )
+    }
+    fn from_keys(mut down: impl FnMut(CGKeyCode) -> bool, caps_lock: bool) -> Self {
+        Self {
+            command: down(55) || down(54),
+            shift: down(56) || down(60),
+            control: down(59) || down(62),
+            option: down(58) || down(61),
+            function: down(63),
+            caps_lock,
+        }
+    }
+}
+
+fn normalize_pointer_flags(event: &CGEvent, remote: XMods, local: LocalPointerModifiers) {
+    let mut flags = to_cgevent_flags(remote);
+    for (held, flag) in [
+        (local.shift, CGEventFlags::CGEventFlagShift),
+        (local.control, CGEventFlags::CGEventFlagControl),
+        (local.option, CGEventFlags::CGEventFlagAlternate),
+        (local.command, CGEventFlags::CGEventFlagCommand),
+        (local.function, CGEventFlags::CGEventFlagSecondaryFn),
+        (local.caps_lock, CGEventFlags::CGEventFlagAlphaShift),
+    ] {
+        if held {
+            flags |= flag;
+        }
+    }
+    // Keep the mouse coalescing hint, but no inherited modifier/device bits.
+    flags |= event.get_flags() & CGEventFlags::CGEventFlagNonCoalesced;
+    event.set_flags(flags);
+}
+
 /// Maps an evdev button code to the CGEventType used for drag events.
 fn drag_event_type(button: u32) -> CGEventType {
     match button {
@@ -104,10 +164,13 @@ impl MacOSEmulation {
     pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
         request_macos_emulation_permissions()?;
 
-        let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        let event_source =
+            new_posting_source().map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
+        let cursor_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
         Ok(Self {
             event_source,
+            cursor_source,
             pressed_buttons: HashSet::new(),
             clicks: ClickTracker::default(),
             repeat_task: None,
@@ -117,8 +180,16 @@ impl MacOSEmulation {
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
-        let event: CGEvent = CGEvent::new(self.event_source.clone()).ok()?;
+        let event: CGEvent = CGEvent::new(self.cursor_source.clone()).ok()?;
         Some(event.location())
+    }
+
+    fn apply_pointer_flags(&self, event: &CGEvent) {
+        normalize_pointer_flags(
+            event,
+            self.modifier_state.get(),
+            LocalPointerModifiers::sample(),
+        );
     }
 
     async fn spawn_repeat_task(&mut self, key: u16) {
@@ -206,6 +277,8 @@ fn request_input_control_permission() -> bool {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGEventSourceKeyState(state: CGEventSourceStateID, key: CGKeyCode) -> bool;
+    fn CGEventSourceFlagsState(state: CGEventSourceStateID) -> u64;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -384,6 +457,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        self.apply_pointer_flags(&event);
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Button {
@@ -452,11 +526,12 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
-                        input_event::button_diagnostics::transition(
-                            input_event::button_diagnostics::Stage::Posted,
+                        self.apply_pointer_flags(&event);
+                        input_event::button_diagnostics::posted_transition(
                             button,
                             state,
-                            Some(click_state),
+                            click_state,
+                            event.get_flags().bits(),
                         );
                         event.post(CGEventTapLocation::HID);
                     }
@@ -486,6 +561,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
+                        self.apply_pointer_flags(&event);
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
@@ -510,6 +586,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
+                        self.apply_pointer_flags(&event);
                         event.post(CGEventTapLocation::HID);
                     }
                 }
@@ -864,5 +941,101 @@ mod click_tracking_tests {
             1
         );
         assert_eq!(c.transition(BTN_LEFT, 0, p, now), 1);
+    }
+}
+
+#[cfg(test)]
+mod pointer_modifier_tests {
+    use super::*;
+
+    fn mouse(source: CGEventSource) -> CGEvent {
+        CGEvent::new_mouse_event(
+            source,
+            CGEventType::LeftMouseDown,
+            CGPoint::new(0., 0.),
+            CGMouseButton::Left,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dictation_command_flag_cannot_turn_single_click_into_command_click() {
+        let event = mouse(new_posting_source().unwrap());
+        // A dictation-style paste leaves aggregate Cmd and left-Cmd flags.
+        event.set_flags(CGEventFlags::from_bits_retain(0x0010_0008));
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+        normalize_pointer_flags(&event, XMods::empty(), LocalPointerModifiers::default());
+        assert_eq!(
+            event.get_flags(),
+            CGEventFlags::empty(),
+            "unheld Command leaked into the pointer event"
+        );
+        assert_eq!(
+            event.get_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE),
+            1
+        );
+    }
+
+    #[test]
+    fn genuine_remote_and_local_modifier_chords_are_preserved_then_released() {
+        let event = mouse(new_posting_source().unwrap());
+        event.set_flags(CGEventFlags::empty());
+        normalize_pointer_flags(
+            &event,
+            XMods::ShiftMask | XMods::ControlMask,
+            LocalPointerModifiers {
+                command: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            event.get_flags(),
+            CGEventFlags::CGEventFlagShift
+                | CGEventFlags::CGEventFlagControl
+                | CGEventFlags::CGEventFlagCommand
+        );
+        normalize_pointer_flags(&event, XMods::empty(), LocalPointerModifiers::default());
+        assert_eq!(event.get_flags(), CGEventFlags::empty());
+    }
+
+    #[test]
+    fn local_modifier_sides_caps_and_fn_are_kept_without_inherited_command() {
+        for keys in [[55, 56, 59, 58, 63], [54, 60, 62, 61, 63]] {
+            let event = mouse(new_posting_source().unwrap());
+            event.set_flags(CGEventFlags::CGEventFlagNonCoalesced);
+            normalize_pointer_flags(
+                &event,
+                XMods::empty(),
+                LocalPointerModifiers::from_keys(|k| keys.contains(&k), true),
+            );
+            assert_eq!(
+                event.get_flags(),
+                CGEventFlags::CGEventFlagCommand
+                    | CGEventFlags::CGEventFlagShift
+                    | CGEventFlags::CGEventFlagControl
+                    | CGEventFlags::CGEventFlagAlternate
+                    | CGEventFlags::CGEventFlagSecondaryFn
+                    | CGEventFlags::CGEventFlagAlphaShift
+                    | CGEventFlags::CGEventFlagNonCoalesced
+            );
+        }
+    }
+
+    #[test]
+    fn posting_state_is_private_and_does_not_replace_global_cursor_reads() {
+        let posted = mouse(new_posting_source().unwrap());
+        let cursor = mouse(CGEventSource::new(CGEventSourceStateID::CombinedSessionState).unwrap());
+        assert_ne!(
+            posted.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
+            0
+        );
+        assert_ne!(
+            posted.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
+            1
+        );
+        assert_eq!(
+            cursor.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
+            0
+        );
     }
 }

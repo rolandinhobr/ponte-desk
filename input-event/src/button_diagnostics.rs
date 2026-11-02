@@ -45,11 +45,14 @@ pub struct Entry {
     pub at_ms: u64,
     pub stage: Stage,
     pub detail: Detail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier_flags: Option<u64>,
 }
 const EMPTY: Entry = Entry {
     at_ms: 0,
     stage: Stage::Physical,
     detail: Detail::Snapshot { serial: 0, mask: 0 },
+    modifier_flags: None,
 };
 
 struct History {
@@ -95,6 +98,9 @@ fn record_to(history: &Mutex<History>, dropped: &AtomicU64, entry: Entry) {
     }
 }
 fn record(stage: Stage, detail: Detail) {
+    record_with_flags(stage, detail, None);
+}
+fn record_with_flags(stage: Stage, detail: Detail, modifier_flags: Option<u64>) {
     let at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -106,6 +112,7 @@ fn record(stage: Stage, detail: Detail) {
             at_ms,
             stage,
             detail,
+            modifier_flags,
         },
     );
 }
@@ -120,6 +127,12 @@ fn transition_detail(button: u32, state: u32, click_count: Option<i64>) -> Optio
 pub fn transition(stage: Stage, button: u32, state: u32, click_count: Option<i64>) {
     if let Some(detail) = transition_detail(button, state, click_count) {
         record(stage, detail);
+    }
+}
+/// Pointer modifiers only: no key codes or typed content are recorded.
+pub fn posted_transition(button: u32, state: u32, click_count: i64, flags: u64) {
+    if let Some(detail) = transition_detail(button, state, Some(click_count)) {
+        record_with_flags(Stage::Posted, detail, Some(flags & 0x00ff_20ff));
     }
 }
 pub fn snapshot_event(stage: Stage, serial: u32, mask: u8) {

@@ -23,7 +23,7 @@ Etapas:
 | `emulated` | Transição aceita pela deduplicação para chamar o backend nativo. |
 | `suppressed` | Pressionamento repetido ignorado pela deduplicação. Solturas redundantes do snapshot não ocupam o histórico. |
 | `cleanup` | Liberação explícita da rota ou de botões mantidos pelo motor. |
-| `posted` | Evento de botão preparado para publicação via Quartz no Mac, com seu `click_count`. Não confirma o consumo pelo aplicativo. |
+| `posted` | Evento de botão preparado para publicação via Quartz no Mac, com seu `click_count`. O campo opcional `modifier_flags` registra a máscara de modificadores desse evento de mouse; ele não contém códigos de teclas nem conteúdo digitado. Não confirma o consumo pelo aplicativo. |
 
 Botões são índices: 0 esquerdo, 1 direito, 2 central, 3 voltar, 4 avançar. `down` distingue pressionar e soltar. Snapshots trazem `serial` e uma máscara dos cinco botões; retransmissões com o mesmo serial não enchem o histórico de envio/recepção. Os relógios das máquinas podem diferir: compare sequências e intervalos de cada lado, sem presumir sincronismo perfeito entre horários absolutos.
 
