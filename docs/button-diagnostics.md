@@ -34,3 +34,10 @@ Ao ocorrer a falha, preserve os dois arquivos de status antes de reiniciar ou pr
 Modificadores momentâneos usam eventos `FlagsChanged` com o código da tecla que mudou e os bits do lado correspondente. Eles não entram na tarefa de repetição de letras. Soltar um lado preserva o outro lado pressionado, e a sincronização absoluta libera cada lado conhecido. Os testes de regressão exercitam mil sequências de atalhos, soltura durante repetição, dois lados e reset absoluto, sem publicar entrada no sistema.
 
 Essa correção cobre um defeito reproduzido em teste no caminho de modificadores. O histórico de uma recorrência mostrou cliques preparados com contagem 1 e Command, mas isso por si só não prova a causa de todo comportamento descrito como clique duplo. Não pressupõe uma dependência de aplicativos de ditado. Preserve os dois status para distinguir uma nova origem.
+
+## Validação desta revisão
+
+- Os cinco testes novos de transição de modificadores falharam com o despacho anterior e passaram com a correção; a construção nativa também confere tipo, identidade e flags de soltura sem publicar eventos.
+- 68 testes no macOS e 49 no Windows passaram; Clippy nos dois sistemas e compilações de produção passaram.
+- Testes isolados do coordenador confirmaram roteamento, modos fixos, pausa por tela cheia/agente, peer expirado e resposta com I/O bloqueado. Esses testes usam backends dummy e não demonstram ausência do sintoma intermitente no uso real.
+- Os núcleos atualizados foram instalados preservando configuração e pareamento; as duas permissões existentes do Mac foram renovadas, e a sessão de webcam foi restaurada em 1920×1080. O histórico ampliado está publicado pelo motor instalado. O comportamento intermitente permanece sujeito à análise de novas ocorrências; uma melhora momentânea não é considerada comprovação da solução.
