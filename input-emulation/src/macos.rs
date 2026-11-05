@@ -26,6 +26,9 @@ use super::error::MacOSEmulationCreationError;
 #[path = "macos_modifiers.rs"]
 mod modifiers;
 use modifiers::KeyAction;
+#[path = "macos_local_modifiers.rs"]
+mod local_modifiers;
+use local_modifiers::LocalModifierMonitor;
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
@@ -36,6 +39,7 @@ pub(crate) struct MacOSEmulation {
     event_source: CGEventSource,
     /// Read the real session cursor, including moves from local devices/agents.
     cursor_source: CGEventSource,
+    local_modifiers: LocalModifierMonitor,
     /// task handle for key repeats
     repeat_task: Option<JoinHandle<()>>,
     /// current state of the mouse buttons (tracked by evdev button code)
@@ -100,16 +104,6 @@ struct LocalPointerModifiers {
 }
 
 impl LocalPointerModifiers {
-    fn sample() -> Self {
-        // Inspect actual modifier key states, not aggregate modifier flags:
-        // the latter can contain an orphan Cmd even in HIDSystemState.
-        Self::from_keys(
-            |key| unsafe { CGEventSourceKeyState(CGEventSourceStateID::HIDSystemState, key) },
-            unsafe { CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState) }
-                & CGEventFlags::CGEventFlagAlphaShift.bits()
-                != 0,
-        )
-    }
     fn from_keys(mut down: impl FnMut(CGKeyCode) -> bool, caps_lock: bool) -> Self {
         Self {
             command: down(55) || down(54),
@@ -183,6 +177,7 @@ impl MacOSEmulation {
         Ok(Self {
             event_source,
             cursor_source,
+            local_modifiers: LocalModifierMonitor::new(),
             pressed_buttons: HashSet::new(),
             clicks: ClickTracker::default(),
             repeat_task: None,
@@ -201,7 +196,7 @@ impl MacOSEmulation {
         normalize_pointer_flags(
             event,
             self.modifier_state.get(),
-            LocalPointerModifiers::sample(),
+            self.local_modifiers.sample(),
         )
     }
 
@@ -300,8 +295,6 @@ fn request_input_control_permission() -> bool {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
-    fn CGEventSourceKeyState(state: CGEventSourceStateID, key: CGKeyCode) -> bool;
-    fn CGEventSourceFlagsState(state: CGEventSourceStateID) -> u64;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]

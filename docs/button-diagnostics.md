@@ -9,7 +9,7 @@ Arquivos locais:
 
 A publicação ocorre junto ao status existente, normalmente a cada cinco segundos, por um worker de gravação. O histórico é circular, substituído conforme novos registros chegam e reiniciado ao encerrar o motor. Não há processo de monitoramento adicional. O buffer é pré-alocado; hooks nunca esperam pelo leitor do diagnóstico. Se houver disputa pelo buffer, só o registro de diagnóstico é descartado e `dropped_records` aumenta; a entrada segue seu caminho normal.
 
-Cada registro contém horário em milissegundos, etapa e uma transição de botão ou estado sincronizado. As máscaras `remote_modifier_flags` e `local_modifier_flags` distinguem o estado remoto da amostra de modificadores locais usada naquele clique; a amostra local do Quartz pode incluir eventos sintéticos e não comprova uma tecla física. Não contém teclas comuns, posição ou deslocamento do cursor, texto, nome de aplicativo, título de janela ou imagem. Não há nova transmissão automática desse histórico pela rede. Os arquivos de status são dados de diagnóstico privados e não devem ser publicados no repositório.
+Cada registro contém horário em milissegundos, etapa e uma transição de botão ou estado sincronizado. As máscaras `remote_modifier_flags` e `local_modifier_flags` distinguem o estado remoto da amostra de modificadores locais usada naquele clique; nas versões anteriores, a amostra local vinha da tabela global do Quartz e podia incluir eventos sintéticos. Agora ela vem de transições locais de modificadores com origem de hardware (PID de origem zero); HID virtual pode ter a mesma classificação. Não contém teclas comuns, posição ou deslocamento do cursor, texto, nome de aplicativo, título de janela ou imagem. Não há nova transmissão automática desse histórico pela rede. Os arquivos de status são dados de diagnóstico privados e não devem ser publicados no repositório.
 
 Etapas:
 
@@ -41,3 +41,13 @@ Essa correção cobre um defeito reproduzido em teste no caminho de modificadore
 - 68 testes no macOS e 49 no Windows passaram; Clippy nos dois sistemas e compilações de produção passaram.
 - Testes isolados do coordenador confirmaram roteamento, modos fixos, pausa por tela cheia/agente, peer expirado e resposta com I/O bloqueado. Esses testes usam backends dummy e não demonstram ausência do sintoma intermitente no uso real.
 - Os núcleos atualizados foram instalados preservando configuração e pareamento; as duas permissões existentes do Mac foram renovadas, e a sessão de webcam foi restaurada em 1920×1080. O histórico ampliado está publicado pelo motor instalado. O comportamento intermitente permanece sujeito à análise de novas ocorrências; uma melhora momentânea não é considerada comprovação da solução.
+
+## Estado local independente de eventos sintéticos
+
+Uma recorrência posterior foi preservada durante o sintoma: cliques de contagem 1 tinham `remote_modifier_flags=0` e `local_modifier_flags=0x100000` (Command). Isso localizou a contaminação na leitura global de teclas do Mac, não no estado remoto. As tabelas de estado do Quartz acumulam estado de fontes que publicam eventos; a fonte privada usada para publicar a ponte não torna uma consulta à tabela HID uma leitura física independente.
+
+O receptor agora mantém um observador passivo só de `FlagsChanged`, aceitando origem de hardware e atualizando apenas o lado da tecla identificado pelo evento. Um Shift físico com flags de Command contaminadas não pode pressionar Command nesse estado. Eventos de programas (inclusive os publicados pela própria ponte) não alteram o estado local. Cada movimento, botão e rolagem lê uma máscara atômica, sem consultar a tabela global, esperar locks, gravar arquivos ou enfileirar entrada. Os modificadores remotos continuam separados e são combinados para preservar atalhos usando teclados dos dois lados.
+
+O observador nunca consome ou modifica eventos. Na desativação do tap ele limpa os modificadores; timeout permite reativação. Se não puder iniciar, os modificadores locais ficam neutros e há um aviso no log, sem voltar à consulta contaminável. Ao ativar o receptor com um modificador já segurado, é necessário soltá-lo e pressioná-lo novamente: não se importa estado global no início. O observador termina junto do receptor; ele não captura texto, cliques, posições ou áudio. Desconexões de um teclado sem evento de soltura e dispositivos HID virtuais permanecem limitações da classificação de eventos.
+
+Referência de estado do Quartz: <https://developer.apple.com/documentation/coregraphics/cgeventsourcestateid>.
