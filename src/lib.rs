@@ -13,3 +13,5 @@ pub mod service;
 
 pub mod preferences;
 pub mod webcam;
+
+pub mod storage;

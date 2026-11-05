@@ -21,3 +21,9 @@ https://github.com/adrbn/liveloop/tree/v1.3.4
 The original signed host and extension are redistributed without modification.
 Runtime CMIO properties customize the public device name and off-air artwork.
 Corresponding source is included in native/macos/camera-extension/vendor-source.
+
+Removable-media sharing additions (0.4):
+The native storage controllers and helpers are part of Ponte Desk, GPL-3.0-or-later.
+The Windows storage component uses C++/WinRT (MIT); its notice is included in
+native/windows/webcam/LICENSE-CppWinRT.txt. OS-provided SMB implementations are
+used through system APIs and are not redistributed.

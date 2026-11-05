@@ -15,9 +15,95 @@ fn write(root: &Path, token: &str, owner: &str, ttl: u64) -> io::Result<()> {
         &serde_json::json!({"owner":owner,"expires":now_ms() as f64/1000.+ttl.clamp(2,600) as f64}),
     )
 }
+fn absent_endpoint_error(error: &io::Error) -> bool {
+    // Access errors and indeterminate probes never prove that a bridge stopped.
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+#[cfg(unix)]
+fn ipc_absent_at(path: &Path) -> bool {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => false,
+        Err(error) => absent_endpoint_error(&error),
+    }
+}
+fn ipc_absent() -> bool {
+    #[cfg(unix)]
+    {
+        lan_mouse_ipc::default_socket_path().is_ok_and(|path| ipc_absent_at(&path))
+    }
+    #[cfg(windows)]
+    {
+        match std::net::TcpStream::connect_timeout(
+            &lan_mouse_ipc::local_ipc_address().into(),
+            Duration::from_millis(200),
+        ) {
+            Ok(_) => false,
+            Err(error) => absent_endpoint_error(&error),
+        }
+    }
+}
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, 0) == 0
+                || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+    }
+    #[cfg(windows)]
+    {
+        unsafe {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+                fn WaitForSingleObject(handle: *mut std::ffi::c_void, millis: u32) -> u32;
+                fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+                fn GetLastError() -> u32;
+            }
+            let handle = OpenProcess(0x100000, 0, pid);
+            if handle.is_null() {
+                return GetLastError() != 87;
+            }
+            let result = WaitForSingleObject(handle, 0);
+            CloseHandle(handle);
+            result != 0
+        }
+    }
+}
+fn recorded_processes_stopped(root: &Path) -> bool {
+    for name in ["engine-status.json", "observer-status.json"] {
+        let data = match fs::read(root.join(name)) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            return false;
+        };
+        if let Some(pid) = value["pid"].as_u64() {
+            if pid > u32::MAX as u64 || process_alive(pid as u32) {
+                return false;
+            }
+        }
+    }
+    true
+}
 fn isolated(root: &Path, since: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(7);
     while Instant::now() < deadline {
+        // The lease is already on disk. With the local engine absent there is
+        // no route for synthetic input to the peer. A later engine starts with
+        // input suspended and reads this lease before enabling its hooks.
+        // IPC is created before native hooks and lives until after teardown.
+        if ipc_absent() && recorded_processes_stopped(root) {
+            return true;
+        }
         let read = |name| {
             fs::read(root.join(name))
                 .ok()
@@ -29,14 +115,16 @@ fn isolated(root: &Path, since: u64) -> bool {
             let recent = observer["timestamp"]
                 .as_f64()
                 .is_some_and(|t| (now_ms() as f64 / 1000. - t).abs() < 2.);
+            let fixed_target = observer["input"]["target_local"] == true;
             let local = engine["timestamp_ms"]
                 .as_u64()
                 .is_some_and(|t| t + 1000 >= since)
                 && engine["capture_installed"] == false
-                && engine["emulation_enabled"] == false;
+                && (engine["emulation_enabled"] == false || fixed_target);
             let peer_age = observer["peer_age"].as_f64();
             let peer = &observer["peer_engine"];
-            let remote = peer["capture_installed"] == false
+            let remote = (peer["capture_installed"] == false
+                || (fixed_target && peer["direct_active"] == true))
                 && peer["emulation_enabled"] == false
                 && peer["ack"].as_u64().unwrap_or(0) > 0;
             // An unreachable peer cannot carry input here: both coordinators
@@ -50,6 +138,7 @@ fn isolated(root: &Path, since: u64) -> bool {
     }
     false
 }
+
 fn run(args: &[String]) -> Result<(), String> {
     let root = root();
     let cmd = args.first().map(String::as_str).unwrap_or("");
@@ -152,4 +241,45 @@ pub fn dispatch() -> Option<i32> {
             2
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ambiguous_endpoint_errors_do_not_authorize_automation() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!absent_endpoint_error(&io::Error::from(kind)));
+        }
+        assert!(absent_endpoint_error(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+    }
+    #[test]
+    fn a_live_recorded_process_blocks_the_stopped_path() {
+        let root = std::env::temp_dir().join(format!("ponte-agent-pid-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        atomic_json(
+            &root.join("engine-status.json"),
+            &serde_json::json!({"pid":std::process::id()}),
+        )
+        .unwrap();
+        assert!(!recorded_processes_stopped(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_live_ipc_listener_cannot_be_treated_as_a_closed_bridge() {
+        let path =
+            std::env::temp_dir().join(format!("ponte-agent-ipc-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(!ipc_absent_at(&path));
+        drop(listener);
+        assert!(ipc_absent_at(&path));
+        fs::remove_file(path).unwrap();
+    }
 }

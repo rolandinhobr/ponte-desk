@@ -4,7 +4,7 @@ import Darwin
 import AVFoundation
 
 // Native, lightweight interface for the integrated Ponte Desk service.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     let root = ProcessInfo.processInfo.environment["PONTE_DESK_HOME"].map{URL(fileURLWithPath:$0)} ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/ponte-desk")
     var cameraProcess: Process?
     var cameraLocal: NSPopUpButton?
@@ -27,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let displays = DisplayController()
     var preview:Bool {ProcessInfo.processInfo.environment["PONTE_DESK_PREVIEW"] == "1"}
     var options:[String:Any] {
-        var values:[String:Any] = ["local_name":"Mac","peer_name":"Windows","shared_monitor":false,"manage_displays":false,"protect_windows_fullscreen":true,"protect_mac_fullscreen":true,"webcam_enabled":true,"windows_monitor":"","mac_monitor_uuid":"","mac_input":0,"pc_input":0]
+        var values:[String:Any] = ["local_name":"Mac","peer_name":"Windows","input_mode":"edges","shared_monitor":false,"manage_displays":false,"protect_windows_fullscreen":true,"protect_mac_fullscreen":true,"webcam_enabled":true,"windows_monitor":"","mac_monitor_uuid":"","mac_input":0,"pc_input":0]
         for (key,value) in readJSON("preferences.json"){values[key]=value};return values
     }
     var localDisplayName:String {options["local_name"] as? String ?? "Mac"}
@@ -39,8 +39,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var permissionsButton:NSButton?;var cameraComponentButton:NSButton?;var inputSwitch:NSSwitch?;var inputState:NSTextField?;var cameraOrigin:NSSegmentedControl?
     var cameraStart:NSButton?;var cameraStop:NSButton?;var cameraNameHint:NSTextField?
     var monitorGroup:NSView?;var monitorStatus:NSTextField?;var autoDisplaySwitch:NSSwitch?;var layoutLabel:NSTextField?
+    var inputMode:NSPopUpButton?
+    var changingInputMode=false
     var settingsController:PonteSettingsController?
     var preparingCamera=false
+    lazy var storage = PonteStorageController(owner:self)
     @objc func showSettings(){if settingsController?.window?.isVisible != true{settingsController=PonteSettingsController(owner:self)};settingsController?.showWindow(nil);NSApp.activate(ignoringOtherApps:true)}
     @objc func cameraOriginChanged(){
         let remote=cameraOrigin?.selectedSegment==1;cameraLocal?.isHidden=remote;cameraRemote?.isHidden = !remote
@@ -87,6 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.command(["settings","layout","--position",position]){result in if let error=result["error"] as? String{completion(error)}else{persist()}}
         }
     }
+    private let commandLock=NSLock()
+    private var commandProcesses=[Process]()
+    private var shuttingDown=false
     func command(_ arguments:[String],completion:@escaping([String:Any])->Void){
         if preview {completion([:]);return}
         let executable=Bundle.main.executableURL
@@ -94,12 +100,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let process=Process();process.executableURL=executable;process.arguments=arguments
             let pipe=Pipe();process.standardOutput=pipe;process.standardError=FileHandle.nullDevice
             var result:[String:Any]=[:]
-            do{try process.run();let data=pipe.fileHandleForReading.readDataToEndOfFile();process.waitUntilExit();result=(try? JSONSerialization.jsonObject(with:data) as? [String:Any]) ?? [:];if process.terminationStatus != 0 && result["error"]==nil{result=["error":"Não foi possível comunicar com o outro computador."]}}catch{result=["error":error.localizedDescription]}
-            DispatchQueue.main.async{completion(result)}
+            do{
+                self.commandLock.lock()
+                if self.shuttingDown {self.commandLock.unlock();return}
+                do{try process.run();self.commandProcesses.append(process);self.commandLock.unlock()}catch{self.commandLock.unlock();throw error}
+                let data=pipe.fileHandleForReading.readDataToEndOfFile();process.waitUntilExit();result=(try? JSONSerialization.jsonObject(with:data) as? [String:Any]) ?? [:];if process.terminationStatus != 0 && result["error"]==nil{result=["error":"Não foi possível comunicar com o outro computador."]}}catch{result=["error":error.localizedDescription]}
+            self.commandLock.lock();self.commandProcesses.removeAll{$0 === process};let stopped=self.shuttingDown;self.commandLock.unlock()
+            if !stopped {DispatchQueue.main.async{completion(result)}}
         }
     }
 
+    private var lastManageDisplays:Bool?
+    private var lastRestoreRequest:Double=0
     func updateDisplay() {
+        let managed=options["manage_displays"] as? Bool == true
+        let request=readJSON("display-restore-request.json")["time"] as? Double ?? 0
+        if (lastManageDisplays == true && !managed) || request>lastRestoreRequest {
+            displays.lastEnable=nil;displays.update(enable:true,root:root)
+        }
+        lastManageDisplays=managed;lastRestoreRequest=request
+
         let state=readJSON("observer-status.json")
         guard let stamp=state["timestamp"] as? Double, Date().timeIntervalSince1970-stamp < 3,
               let display=state["display"] as? [String:Any], display["automatic"] as? Bool == true,
@@ -121,7 +141,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         signal(SIGTERM, SIG_IGN)
         let source=DispatchSource.makeSignalSource(signal:SIGTERM,queue:.main)
-        source.setEventHandler { NSApp.terminate(nil) }; source.resume(); terminationSource=source
+        source.setEventHandler {
+            // AppKit's asynchronous termination pumps a nested run loop.
+            // Enter it outside a GCD main-queue handler so completion blocks
+            // can still drain instead of deadlocking a SIGTERM update.
+            RunLoop.main.perform(inModes:[.default,.modalPanel,.eventTracking]) {NSApp.terminate(nil)}
+        }; source.resume(); terminationSource=source
         item = NSStatusBar.system.statusItem(withLength: 26)
         item.button?.image = PonteArtwork.menuIcon()
         item.button?.imagePosition = .imageOnly
@@ -129,11 +154,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.button?.toolTip = "Ponte Desk — seus computadores, juntos"
         let menu = NSMenu(); menu.delegate = self; item.menu = menu
         if !preview {startObserver()}
+        storage.refreshAll()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             if let self=self, !self.preview, self.observer?.isRunning != true, Date().timeIntervalSince(self.lastStart)>10 {self.startObserver()}
             if self?.preview != true {self?.updateDisplay();self?.finishCameraSetupIfReady()}
             if self?.panel?.isVisible == true { self?.refreshPanel();self?.refreshCameraStatus() }
+            self?.storage.tick()
         }
+        if let timer {RunLoop.main.add(timer,forMode:.modalPanel)}
         if !CommandLine.arguments.contains("--background") { showPanel() }
     }
 
@@ -169,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "Controle local protegido"
     }
 
-    var paused: Bool { FileManager.default.fileExists(atPath: root.appendingPathComponent("manual-pause").path) }
+    var paused: Bool { FileManager.default.fileExists(atPath: root.appendingPathComponent("manual-pause").path) || readJSON("observer-status.json")["peer_paused"] as? Bool == true }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
@@ -179,26 +207,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let toggle = NSMenuItem(title: paused ? "Retomar teclado e mouse" : "Pausar teclado e mouse", action: #selector(togglePause), keyEquivalent: ""); toggle.target = self; menu.addItem(toggle)
         let settings=NSMenuItem(title:"Ajustes…",action:#selector(showSettings),keyEquivalent:",");settings.target=self;menu.addItem(settings)
         let cameraStop=NSMenuItem(title:"Parar compartilhamento da webcam",action:#selector(stopWebcam),keyEquivalent:"");cameraStop.target=self;menu.addItem(cameraStop)
+        let hide=NSMenuItem(title:"Recolher painel",action:#selector(hidePanel),keyEquivalent:"");hide.target=self;menu.addItem(hide)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Encerrar Ponte Desk", action: #selector(quit), keyEquivalent: "q"); quit.target = self; menu.addItem(quit)
     }
 
     @objc func showPanel(){
-        if panel==nil{panel=buildPontePanel(self);cameraOrigin?.selectedSegment=UserDefaults.standard.integer(forKey:"webcamOrigin");cameraOriginChanged();refreshCameras()}
+        if panel==nil{panel=buildPontePanel(self);panel?.delegate=self;cameraOrigin?.selectedSegment=UserDefaults.standard.integer(forKey:"webcamOrigin");cameraOriginChanged();refreshCameras()}
         refreshPanel();panel?.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
+        storage.refreshAll()
     }
     func refreshPanel(){
         statusText?.stringValue=mode();item?.button?.image=PonteArtwork.menuIcon(paused:paused)
         inputSwitch?.state=paused ? .off:.on
+        let fixed=(options["input_mode"] as? String ?? "edges") != "edges"
+        if !changingInputMode{inputMode?.selectItem(at:["edges","to_mac","to_pc"].firstIndex(of:options["input_mode"] as? String ?? "edges") ?? 0)}
         let state=readJSON("observer-status.json"),policy=state["policy"] as? [Any]
         inputState?.stringValue=preview ? "Disponível nos dois sentidos" : policy?.last as? String ?? "Configure o par para começar"
         let permission=preview || (AXIsProcessTrusted() && CGPreflightListenEventAccess())
         detailText?.stringValue=permission ? "":"Autorize controle e monitoração de entrada nas permissões deste Mac."
         detailText?.isHidden=permission;permissionsButton?.isHidden=permission
         let directions=["left":"à esquerda","right":"à direita","top":"acima","bottom":"abaixo"]
-        layoutLabel?.stringValue="\(peerDisplayName) \(directions[peerPosition] ?? "ao lado")";layoutLabel?.isHidden=false
+        layoutLabel?.stringValue="\(peerDisplayName) \(directions[peerPosition] ?? "ao lado")";layoutLabel?.isHidden=fixed
         let shared=options["shared_monitor"] as? Bool == true
-        monitorGroup?.isHidden = !shared;autoDisplaySwitch?.state=options["manage_displays"] as? Bool == true ? .on:.off
+        monitorGroup?.isHidden = !shared || fixed;autoDisplaySwitch?.state=options["manage_displays"] as? Bool == true ? .on:.off
         monitorStatus?.stringValue=policy?.last as? String ?? "Aguardando monitor"
         let cameraEnabled=options["webcam_enabled"] as? Bool != false
         cameraStart?.isEnabled=cameraEnabled && !preview
@@ -207,11 +239,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !cameraEnabled{cameraState?.stringValue="Webcam desativada nos ajustes"}
     }
 
+    @objc func changeInputMode(){
+        guard !preview,!changingInputMode,let peer=cameraPeer,let index=inputMode?.indexOfSelectedItem,index>=0,index<3 else{return}
+        changingInputMode=true;inputMode?.isEnabled=false
+        let selected=["edges","to_mac","to_pc"][index]
+        let patch=String(decoding:try! JSONSerialization.data(withJSONObject:["input_mode":selected]),as:UTF8.self)
+        command(["settings","update","--patch",patch]){[weak self] result in
+            guard let self else{return}
+            if let error=result["error"] as? String{self.changingInputMode=false;self.inputMode?.isEnabled=true;self.detailText?.stringValue=error;self.detailText?.isHidden=false;return}
+            self.command(["settings","bridge","--enabled","true","--peer",peer]){result in
+                self.changingInputMode=false;self.inputMode?.isEnabled=true;self.refreshPanel()
+                if let error=result["error"] as? String{self.detailText?.stringValue=error;self.detailText?.isHidden=false}
+            }
+        }
+    }
     @objc func togglePause() {
-        let path=root.appendingPathComponent("manual-pause")
-        if paused { try? FileManager.default.removeItem(at:path) }
-        else { try? Data("paused".utf8).write(to:path,options:.atomic) }
-        refreshPanel()
+        guard let peer=cameraPeer else{return}
+        command(["settings","bridge","--enabled",paused ? "true":"false","--peer",peer]){[weak self] result in
+            if let error=result["error"] as? String{self?.detailText?.stringValue=error;self?.detailText?.isHidden=false}
+            self?.refreshPanel()
+        }
     }
 
     @objc func openPermissions() {
@@ -291,11 +338,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func installCameraDriver(){beginCameraSetup()}
     @objc func toggleDisplays(){var values=options;values["manage_displays"]=autoDisplaySwitch?.state == .on;saveOptions(values,position:peerPosition){[weak self] error in if let error{self?.monitorStatus?.stringValue=error}}}
     @objc func restoreDisplays(){guard !preview else{return};var values=options;values["manage_displays"]=false;saveOptions(values,position:peerPosition){_ in};displays.lastEnable=nil;displays.update(enable:true,root:root)}
+    @objc func hidePanel(){panel?.orderOut(nil)}
     @objc func quit() { NSApp.terminate(nil) }
+    func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+        // Quitting is an unconditional user command. Storage/network health
+        // must never veto or defer it, including Cmd+Q and the menu command.
+        .terminateNow
+    }
+    func windowShouldClose(_ sender:NSWindow)->Bool {
+        if sender === panel {hidePanel();return false}
+        return true
+    }
     func applicationWillTerminate(_ notification: Notification) {
-        timer?.invalidate()
-        if let cameraProcess=cameraProcess,cameraProcess.isRunning{cameraProcess.interrupt()}
-        if let observer=observer, observer.isRunning { kill(observer.processIdentifier, SIGINT) }
+        timer?.invalidate();storage.invalidate()
+        commandLock.lock();shuttingDown=true;let commands=commandProcesses;commandProcesses.removeAll();commandLock.unlock()
+        for process in commands where process.isRunning {process.terminate()}
+        if let cameraProcess,cameraProcess.isRunning{cameraProcess.interrupt()}
+        if let observer,observer.isRunning {
+            observer.interrupt()
+            // A local process deadline, not a remote round trip. Normal SIGINT
+            // releases keys/buttons; a stuck owned engine cannot retain the app.
+            let deadline=Date().addingTimeInterval(0.7)
+            while observer.isRunning && Date()<deadline {Thread.sleep(forTimeInterval:0.02)}
+            if observer.isRunning {kill(observer.processIdentifier,SIGKILL)}
+        }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool { false }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool { showPanel(); return true }
@@ -414,3 +480,19 @@ final class DisplayController {
     }
 }
 extension SavedScreen: Equatable {}
+
+// Enumerates display metadata for either computer's settings panel.
+@_cdecl("ponte_monitor_catalog_json")
+public func ponteMonitorCatalogJSON()->UnsafeMutablePointer<CChar>? {
+    autoreleasepool {
+        var ids=[CGDirectDisplayID](repeating:0,count:32);var count:UInt32=0
+        _ = CGGetActiveDisplayList(32,&ids,&count)
+        var monitors=ids.prefix(Int(count)).compactMap{id -> [String:Any]? in
+            guard CGDisplayIsBuiltin(id)==0,let uuid=CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else{return nil}
+            return ["id":CFUUIDCreateString(nil,uuid) as String,"name":"Monitor externo do Mac"]
+        }
+        if let saved=MonitorIdentity.configuration["mac_monitor_uuid"] as? String,!saved.isEmpty,!monitors.contains(where:{$0["id"] as? String==saved}){monitors.append(["id":saved,"name":"Monitor configurado (desativado)"])}
+        guard let data=try? JSONSerialization.data(withJSONObject:["monitors":monitors]) else{return nil}
+        return strdup(String(decoding:data,as:UTF8.self))
+    }
+}

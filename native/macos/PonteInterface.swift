@@ -15,6 +15,10 @@ private final class PontePanelBackground: NSView {
     }
 }
 
+private final class PontePanelDocument: NSView {
+    override var isFlipped: Bool { true }
+}
+
 private final class PonteSurface: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -105,7 +109,7 @@ private enum PonteLayout {
 /// Builds controls only. The owner applies observed state and visibility and
 /// owns all camera, permission, service and configuration operations.
 func buildPontePanel(_ owner: AppDelegate) -> NSWindow {
-    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: owner.options["shared_monitor"] as? Bool == true ? 650 : 550),
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 720),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
     window.title = "Ponte Desk"
@@ -168,7 +172,12 @@ func buildPontePanel(_ owner: AppDelegate) -> NSWindow {
                                           action: #selector(AppDelegate.openPermissions), small: true)
     owner.permissionsButton=permissions
     permissions.toolTip = "Verificar as permissões de controle deste Mac"
-    let inputCard = PonteLayout.card([inputHeading, computerRow,
+    let inputMode=NSPopUpButton()
+    inputMode.addItems(withTitles:["Passar pelas bordas", "Usar os periféricos dos dois neste Mac", "Usar os periféricos dos dois no Windows"])
+    inputMode.target=owner;inputMode.action=#selector(AppDelegate.changeInputMode)
+    inputMode.setAccessibilityLabel("Destino do teclado e mouse")
+    owner.inputMode=inputMode
+    let inputCard = PonteLayout.card([inputHeading, computerRow, inputMode,
         PonteLayout.row([inputState, PonteLayout.spacer(), permissions]), layout, detail], spacing: 8)
 
     let component = PonteLayout.button("Configurar câmera…", owner: owner,
@@ -246,16 +255,35 @@ func buildPontePanel(_ owner: AppDelegate) -> NSWindow {
 
     let footer = PonteLayout.label("Controle local: Ctrl + Alt/Option + Esc", size: 11, secondary: true)
     footer.alignment = .center
-    let stack = PonteLayout.column([header, inputCard, cameraCard, monitorCard], spacing: 14)
+    let storageCard = PonteLayout.card([owner.storage.makeView()])
+    let stack = PonteLayout.column([inputCard, cameraCard, storageCard, monitorCard], spacing: 14)
     stack.translatesAutoresizingMaskIntoConstraints = false
     footer.translatesAutoresizingMaskIntoConstraints = false
-    root.addSubview(stack)
+    header.translatesAutoresizingMaskIntoConstraints = false
+    let scroll = NSScrollView()
+    scroll.translatesAutoresizingMaskIntoConstraints = false
+    scroll.drawsBackground = false; scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = true; scroll.borderType = .noBorder
+    let document = PontePanelDocument()
+    document.translatesAutoresizingMaskIntoConstraints = false
+    scroll.documentView = document
+    document.addSubview(stack)
+    root.addSubview(header)
+    root.addSubview(scroll)
     root.addSubview(footer)
     NSLayoutConstraint.activate([
-        stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
-        stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
-        stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
-        stack.bottomAnchor.constraint(lessThanOrEqualTo: footer.topAnchor, constant: -16),
+        header.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
+        header.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+        header.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
+        scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+        scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+        scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 16),
+        scroll.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -14),
+        document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+        stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 20),
+        stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -20),
+        stack.topAnchor.constraint(equalTo: document.topAnchor),
+        stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -8),
         footer.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
         footer.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
         footer.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18)
