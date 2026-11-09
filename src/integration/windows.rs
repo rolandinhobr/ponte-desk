@@ -503,12 +503,15 @@ fn scan_monitors(target: String, listing: bool) -> MonitorScan {
 pub fn monitor_catalog() -> serde_json::Value {
     serde_json::json!({"monitors":scan_monitors(String::new(),true).catalog})
 }
+fn monitor_probe_requested(options: &crate::preferences::Preferences) -> bool {
+    options.shared_monitor
+        && !options.windows_monitor.is_empty()
+        && (options.input_mode == "edges"
+            || (options.input_mode == "auto" && (options.auto_monitor || options.manage_displays)))
+}
 fn read_monitor_input() -> DdcSample {
     let options = crate::preferences::Preferences::load(&super::native::root());
-    if options.input_mode != "edges"
-        || !options.shared_monitor
-        || options.windows_monitor.is_empty()
-    {
+    if !monitor_probe_requested(&options) {
         return DdcSample::default();
     }
     scan_monitors(options.windows_monitor, false).sample
@@ -550,6 +553,26 @@ fn monitor_worker() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_monitor_worker_is_enabled_and_optional_without_changing_fixed_modes() {
+        let mut p = crate::preferences::Preferences {
+            input_mode: "auto".into(),
+            shared_monitor: true,
+            windows_monitor: "test-monitor".into(),
+            ..Default::default()
+        };
+        assert!(monitor_probe_requested(&p));
+        p.auto_monitor = false;
+        assert!(!monitor_probe_requested(&p));
+        p.manage_displays = true;
+        assert!(monitor_probe_requested(&p));
+        p.input_mode = "to_mac".into();
+        assert!(!monitor_probe_requested(&p));
+        p.input_mode = "edges".into();
+        assert!(monitor_probe_requested(&p));
+        p.shared_monitor = false;
+        assert!(!monitor_probe_requested(&p));
+    }
     fn monitor() -> Rect {
         Rect {
             left: 0,
