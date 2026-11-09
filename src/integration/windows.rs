@@ -83,8 +83,6 @@ mod ffi {
         pub fn SetProcessDpiAwarenessContext(context: Handle) -> i32;
         pub fn SetThreadDpiAwarenessContext(context: Handle) -> Handle;
         pub fn GetForegroundWindow() -> Handle;
-        pub fn OpenInputDesktop(flags: u32, inherit: i32, access: u32) -> Handle;
-        pub fn CloseDesktop(desktop: Handle) -> i32;
         pub fn GetAncestor(window: Handle, flags: u32) -> Handle;
         pub fn GetDesktopWindow() -> Handle;
         pub fn GetShellWindow() -> Handle;
@@ -218,6 +216,45 @@ pub fn start_monitor_probe() {
     });
 }
 
+#[link(name = "wtsapi32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn WTSQuerySessionInformationW(
+        server: Handle,
+        session: u32,
+        class: u32,
+        buffer: *mut *mut u16,
+        bytes: *mut u32,
+    ) -> i32;
+    fn WTSFreeMemory(buffer: Handle);
+}
+fn session_locked() -> Option<bool> {
+    let mut buffer = null_mut();
+    let mut bytes = 0;
+    let ok =
+        unsafe { WTSQuerySessionInformationW(null_mut(), u32::MAX, 25, &mut buffer, &mut bytes) };
+    if ok == 0 || buffer.is_null() {
+        return None;
+    }
+    // Win64 WTSINFOEX: level DWORD, union aligned to 8, then session ID,
+    // connection state, and session flags. Only read the bounded prefix.
+    let result = if bytes >= 20 {
+        let p = buffer.cast::<u8>();
+        let level = unsafe { std::ptr::read_unaligned(p.cast::<u32>()) };
+        let flags = unsafe { std::ptr::read_unaligned(p.add(16).cast::<i32>()) };
+        (level == 1).then_some(flags).and_then(|v| match v {
+            0 => Some(true),
+            1 => Some(false),
+            _ => None,
+        })
+    } else {
+        None
+    };
+    unsafe {
+        WTSFreeMemory(buffer.cast());
+    }
+    result
+}
+
 /// Fast foreground snapshot. DDC never runs on this calling thread.
 pub fn probe() -> PlatformState {
     start_monitor_probe();
@@ -231,15 +268,9 @@ pub fn probe() -> PlatformState {
         cache.refresh = true;
         runtime.wake.notify_one();
     }
-    let desktop = unsafe { ffi::OpenInputDesktop(0, 0, 1) };
-    let locked = desktop.is_null();
-    if !desktop.is_null() {
-        unsafe {
-            ffi::CloseDesktop(desktop);
-        }
-    }
+    let locked = session_locked();
     PlatformState {
-        locked: Some(locked),
+        locked,
         monitor_present: cache.present,
         fullscreen,
         input: cache.input,

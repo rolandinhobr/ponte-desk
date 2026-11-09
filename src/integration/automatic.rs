@@ -8,6 +8,8 @@ pub struct Decision {
     pub revision: u64,
     pub reason: String,
     pub waiting_release: bool,
+    #[serde(default)]
+    pub local_control: bool,
 }
 #[derive(Default)]
 pub(super) struct Selector {
@@ -17,6 +19,7 @@ pub(super) struct Selector {
     locked: [Option<bool>; 2],
     unlock_pending: [Option<u64>; 2],
     last_claim_at: u64,
+    unlock_gate: bool,
     monitor: Option<u32>,
     monitor_candidate: Option<(u32, u64)>,
     pending: Option<(String, String, u64)>,
@@ -32,6 +35,7 @@ impl Selector {
                 revision: 1,
                 reason: "Computador preferido na chegada".into(),
                 waiting_release: false,
+                local_control: false,
             });
             self.entered = true;
             self.last_human = now;
@@ -49,6 +53,7 @@ impl Selector {
                 }
                 let unlocked = self.locked[i] == Some(true) && state.platform.locked == Some(false);
                 if unlocked {
+                    self.unlock_gate = true;
                     self.unlock_pending[i] = Some(now);
                 }
                 if state.agent {
@@ -151,7 +156,14 @@ impl Selector {
                 self.pending = None;
             }
         }
+        if self.unlock_pending.iter().all(Option::is_none) && self.pending.is_none() && !held {
+            self.unlock_gate = false;
+        }
         let d = self.decision.as_mut().unwrap();
+        d.local_control = options.auto_unlock
+            && (self.unlock_gate
+                || mac.platform.locked == Some(true)
+                || pc.platform.locked == Some(true));
         d.waiting_release = self.pending.is_some() && held;
         d.clone()
     }
@@ -220,6 +232,26 @@ mod tests {
         assert_eq!(x.update(20000, &p, &m, &pc).target, "mac");
         m.activity.as_mut().unwrap().held = false;
         assert_eq!(x.update(21000, &p, &m, &pc).target, "mac");
+    }
+    #[test]
+    fn first_click_after_unlock_remains_local_through_its_release() {
+        let (p, m, mut pc) = pair();
+        pc.platform.locked = Some(true);
+        let mut x = Selector::default();
+        assert!(x.update(2000, &p, &m, &pc).local_control);
+        pc.platform.locked = Some(false);
+        assert!(x.update(4000, &p, &m, &pc).local_control);
+        let a = pc.activity.as_mut().unwrap();
+        a.serial = 1;
+        a.age_ms = Some(0);
+        a.held = true;
+        let d = x.update(4500, &p, &m, &pc);
+        assert!(d.local_control && d.waiting_release);
+        assert_eq!(d.target, "mac");
+        pc.activity.as_mut().unwrap().held = false;
+        let d = x.update(5000, &p, &m, &pc);
+        assert!(!d.local_control);
+        assert_eq!(d.target, "pc");
     }
     #[test]
     fn donor_activity_does_not_bounce_back() {

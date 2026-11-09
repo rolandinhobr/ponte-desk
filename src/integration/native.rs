@@ -235,6 +235,9 @@ pub fn choose_policy(
         let Some(decision) = &mac.automatic else {
             return Policy::local("Automático: aguardando destino");
         };
+        if decision.local_control {
+            return Policy::local("Automático: controle local durante bloqueio e desbloqueio");
+        }
         if !["mac", "pc"].contains(&decision.target.as_str()) {
             return Policy::local("Destino automático inválido");
         }
@@ -651,6 +654,7 @@ mod tests {
                 revision: 1,
                 reason: "test".into(),
                 waiting_release: false,
+                local_control: false,
             }),
             direct_supported: true,
             ..Default::default()
@@ -695,6 +699,14 @@ mod tests {
         pc.manual_pause = false;
         pc.platform.fullscreen = true;
         assert!(!choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+    }
+    #[test]
+    fn automatic_local_unlock_gate_never_captures_even_with_peer_ready() {
+        let (mut mac, pc) = automatic_pair();
+        mac.automatic.as_mut().unwrap().local_control = true;
+        let a = choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac"));
+        let b = choose_policy("pc", &pc, Some(&mac), Duration::ZERO, &cfg("pc"));
+        assert!(!a.capture && !a.emulation && !b.capture && !b.emulation);
     }
     #[test]
     fn automatic_target_agent_keeps_route_source_agent_suspends() {
