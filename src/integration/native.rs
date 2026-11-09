@@ -532,7 +532,11 @@ impl Coordinator {
                     .is_some_and(|p| p.auto_local_activity);
             input_event::activity::configure(
                 !protected,
-                target == Some(self.config.side.as_str()) || mac_takeover,
+                // Windows physical input is ambiguous: it may be the mouse
+                // already borrowed by the Mac. Unlock/monitor choose Windows;
+                // confirming the current Windows target must not beat a new
+                // Mac local takeover in the same metadata interval.
+                !cfg!(windows) && (target == Some(self.config.side.as_str()) || mac_takeover),
                 mac_takeover && !protected,
             );
         } else {
