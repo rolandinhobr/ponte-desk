@@ -12,7 +12,7 @@ members = [
 [package]
 name = "ponte-desk"
 description = "Integrated local keyboard, mouse, webcam, storage and display control"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
@@ -71,6 +71,10 @@ sha2 = "0.10.8"
 hmac = "0.12.1"
 pem = "3.0.6"
 notify = "8.2.0"
+
+[target.'cfg(target_os="macos")'.dependencies]
+core-foundation = "0.10.0"
+core-graphics = { version = "0.25.0", features = ["highsierra"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"

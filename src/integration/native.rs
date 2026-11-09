@@ -18,6 +18,8 @@ pub struct PlatformState {
     pub input: Option<u32>,
     pub input_age_ms: Option<u64>,
     pub asleep: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<bool>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -34,6 +36,10 @@ pub struct State {
     pub direct_active: bool,
     #[serde(default)]
     pub preferences: Option<crate::preferences::Preferences>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<input_event::activity::Sample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic: Option<super::automatic::Decision>,
 }
 #[derive(Clone, Deserialize)]
 pub struct Settings {
@@ -216,7 +222,52 @@ pub fn choose_policy(
     } else {
         (peer, local)
     };
-    let options = mac.preferences.clone().unwrap_or_default();
+    let mut options = mac.preferences.clone().unwrap_or_default();
+    let auto = options.input_mode == "auto";
+    let mut auto_reason = None;
+    if auto {
+        if ![mac, pc]
+            .iter()
+            .all(|s| s.activity.as_ref().is_some_and(|a| a.ready))
+        {
+            return Policy::local("Automático: aguardando detecção nas duas máquinas");
+        }
+        let Some(decision) = &mac.automatic else {
+            return Policy::local("Automático: aguardando destino");
+        };
+        if !["mac", "pc"].contains(&decision.target.as_str()) {
+            return Policy::local("Destino automático inválido");
+        }
+        options.input_mode = if decision.target == "mac" {
+            "to_mac"
+        } else {
+            "to_pc"
+        }
+        .into();
+        auto_reason = Some(format!(
+            "Automático · {} · {}{}",
+            if decision.target == "mac" {
+                "Mac"
+            } else {
+                "Windows"
+            },
+            decision.reason,
+            if decision.waiting_release {
+                " · aguardando soltar teclas/botões"
+            } else {
+                ""
+            }
+        ));
+    }
+    if auto
+        && options.protect_windows_fullscreen
+        && pc.platform.fullscreen
+        && (!options.shared_monitor
+            || (pc.platform.input == Some(options.pc_input)
+                && pc.platform.input_age_ms.is_some_and(|a| a < 12000)))
+    {
+        return Policy::local("Automático: tela cheia no Windows protegida");
+    }
     let fixed = options.input_mode != "edges";
     let target = if options.input_mode == "to_mac" {
         "mac"
@@ -236,14 +287,16 @@ pub fn choose_policy(
             capture: !receiving && peer.emulation && !peer.capture && !local.emulation,
             emulation: receiving,
             direct: !receiving,
-            reason: if receiving {
-                "Periféricos do outro computador conectados aqui"
-            } else if peer.emulation {
-                "Teclado e mouse fixos no outro computador"
-            } else {
-                "Aguardando o destino liberar os periféricos"
-            }
-            .into(),
+            reason: auto_reason.unwrap_or_else(|| {
+                if receiving {
+                    "Periféricos do outro computador conectados aqui"
+                } else if peer.emulation {
+                    "Teclado e mouse fixos no outro computador"
+                } else {
+                    "Aguardando o destino liberar os periféricos"
+                }
+                .into()
+            }),
             expires_ms: now_ms() + 8_000,
         };
     }
@@ -315,6 +368,7 @@ impl LocalFiles {
 pub struct Coordinator {
     pub root: PathBuf,
     pub local: State,
+    selector: super::automatic::Selector,
     config: Settings,
     socket: UdpSocket,
     auth: Auth,
@@ -357,6 +411,7 @@ impl Coordinator {
         )?;
         Ok(Self {
             root,
+            selector: super::automatic::Selector::default(),
             local: State {
                 preferences: Some(options),
                 direct_supported: true,
@@ -422,7 +477,7 @@ impl Coordinator {
                 .local
                 .preferences
                 .as_ref()
-                .is_some_and(|p| p.input_mode != "edges")
+                .is_some_and(|p| p.input_mode != "edges" && p.input_mode != "auto")
             {
                 self.local.platform = PlatformState::default();
                 self.platform_ready = true;
@@ -432,6 +487,56 @@ impl Coordinator {
                 self.local.platform = sample.unwrap_or_default();
             }
             self.last_probe = Instant::now();
+        }
+        let automatic = self
+            .local
+            .preferences
+            .as_ref()
+            .is_some_and(|p| p.input_mode == "auto");
+        if automatic {
+            super::activity::start();
+            if self.local.platform.locked == Some(true) {
+                input_event::activity::clear_held();
+            }
+            self.local.activity = Some(input_event::activity::sample());
+            if self.config.side == "mac" {
+                if let Some(peer) = self
+                    .peer
+                    .as_ref()
+                    .filter(|_| self.peer_seen.elapsed() < Duration::from_secs(6))
+                {
+                    let options = self.local.preferences.clone().unwrap_or_default();
+                    self.local.automatic =
+                        Some(self.selector.update(now_ms(), &options, &self.local, peer));
+                }
+            } else {
+                self.local.automatic = self.peer.as_ref().and_then(|p| p.automatic.clone());
+            }
+            let target = self.local.automatic.as_ref().map(|d| d.target.as_str());
+            let protected = self.local.agent
+                || self.local.manual_pause
+                || self.peer.as_ref().is_none_or(|p| p.agent || p.manual_pause)
+                || self.peer_seen.elapsed() >= Duration::from_secs(6);
+            // Forwarded donor activity counts as human activity but never
+            // reclaims the donor. Mac local takeover is explicit and bypasses
+            // capture before the first event can be sent to the old target.
+            let mac_takeover = self.config.side == "mac"
+                && target == Some("pc")
+                && self
+                    .local
+                    .preferences
+                    .as_ref()
+                    .is_some_and(|p| p.auto_local_activity);
+            input_event::activity::configure(
+                !protected,
+                target == Some(self.config.side.as_str()) || mac_takeover,
+                mac_takeover && !protected,
+            );
+        } else {
+            input_event::activity::configure(false, false, false);
+            self.local.activity = None;
+            self.local.automatic = None;
+            self.selector = super::automatic::Selector::default();
         }
         let candidate = if !self.platform_ready {
             Policy::local("metadados do sistema indisponíveis: controle local")
@@ -481,9 +586,9 @@ impl Coordinator {
             let status = serde_json::json!({"timestamp":now_ms() as f64/1000.,"pid":std::process::id(),"side":self.config.side,"peer_paused":self.peer.as_ref().is_some_and(|p|p.manual_pause),"peer_address":self.learned.map(|a|a.ip().to_string()),
                 "local":self.local,"peer_age":if peer.is_some(){Some(self.peer_seen.elapsed().as_secs_f64())}else{None},
                 "peer_engine":peer.map(|p|serde_json::json!({"capture_installed":p.capture,"emulation_enabled":p.emulation,"direct_active":p.direct_active,"ack":p.ack})),
-                "input":{"mode":self.local.preferences.as_ref().map(|p|p.input_mode.as_str()),"target_local":self.local.preferences.as_ref().is_some_and(|p|(p.input_mode=="to_mac"&&self.config.side=="mac")||(p.input_mode=="to_pc"&&self.config.side=="pc"))},
+                "input":{"mode":self.local.preferences.as_ref().map(|p|p.input_mode.as_str()),"target_local":self.local.preferences.as_ref().is_some_and(|p|(p.input_mode=="to_mac"&&self.config.side=="mac")||(p.input_mode=="to_pc"&&self.config.side=="pc")||(p.input_mode=="auto"&&self.local.automatic.as_ref().is_some_and(|d|d.target==self.config.side))),"automatic":self.local.automatic},
                 "policy":[self.applied.capture,self.applied.emulation,self.applied.reason],
-                "display":{"automatic":self.local.preferences.as_ref().is_some_and(|p|p.manage_displays && p.shared_monitor && p.input_mode == "edges"),"input":pc.and_then(|p|p.platform.input),"input_age_ms":pc.and_then(|p|p.platform.input_age_ms),"peer_fresh":self.peer_seen.elapsed()<Duration::from_secs(6),"mac_input":self.local.preferences.as_ref().map_or(0,|p|p.mac_input),"pc_input":self.local.preferences.as_ref().map_or(0,|p|p.pc_input)}});
+                "display":{"automatic":self.local.preferences.as_ref().is_some_and(|p|p.manage_displays && p.shared_monitor && (p.input_mode == "edges" || p.input_mode == "auto")),"input":pc.and_then(|p|p.platform.input),"input_age_ms":pc.and_then(|p|p.platform.input_age_ms),"peer_fresh":self.peer_seen.elapsed()<Duration::from_secs(6),"mac_input":self.local.preferences.as_ref().map_or(0,|p|p.mac_input),"pc_input":self.local.preferences.as_ref().map_or(0,|p|p.pc_input)}});
             let _ = self
                 .status_writer
                 .submit((self.root.join("observer-status.json"), status));
@@ -503,7 +608,12 @@ impl Coordinator {
         self.local.ack = if (self.local.agent || self.peer.as_ref().is_some_and(|p| p.agent))
             && ((!capture && !emulation)
                 || self.local.preferences.as_ref().is_some_and(|p| {
-                    let target = if p.input_mode == "to_mac" {
+                    let target = if p.input_mode == "auto" {
+                        self.local
+                            .automatic
+                            .as_ref()
+                            .map_or("", |d| d.target.as_str())
+                    } else if p.input_mode == "to_mac" {
                         "mac"
                     } else {
                         "pc"
@@ -525,6 +635,75 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn automatic_pair() -> (State, State) {
+        let p = crate::preferences::Preferences {
+            input_mode: "auto".into(),
+            ..Default::default()
+        };
+        let mut mac = State {
+            preferences: Some(p),
+            activity: Some(input_event::activity::Sample {
+                ready: true,
+                ..Default::default()
+            }),
+            automatic: Some(super::super::automatic::Decision {
+                target: "mac".into(),
+                revision: 1,
+                reason: "test".into(),
+                waiting_release: false,
+            }),
+            direct_supported: true,
+            ..Default::default()
+        };
+        mac.emulation = true;
+        let pc = State {
+            activity: Some(input_event::activity::Sample {
+                ready: true,
+                ..Default::default()
+            }),
+            direct_supported: true,
+            capture: true,
+            direct_active: true,
+            ..Default::default()
+        };
+        (mac, pc)
+    }
+    #[test]
+    fn automatic_switch_waits_for_old_capture_to_leave_before_reversing() {
+        let (mut mac, mut pc) = automatic_pair();
+        mac.automatic.as_mut().unwrap().target = "pc".into();
+        let a = choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac"));
+        assert!(!a.capture && !a.emulation);
+        let b = choose_policy("pc", &pc, Some(&mac), Duration::ZERO, &cfg("pc"));
+        assert!(!b.capture && b.emulation);
+        pc.capture = false;
+        pc.emulation = true;
+        mac.emulation = false;
+        assert!(choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).capture);
+    }
+    #[test]
+    fn automatic_requires_both_observers_and_respects_pause_and_fullscreen() {
+        let (mac, mut pc) = automatic_pair();
+        pc.activity = None;
+        assert!(!choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+        pc.activity = Some(input_event::activity::Sample {
+            ready: true,
+            ..Default::default()
+        });
+        pc.manual_pause = true;
+        assert!(!choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+        pc.manual_pause = false;
+        pc.platform.fullscreen = true;
+        assert!(!choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+    }
+    #[test]
+    fn automatic_target_agent_keeps_route_source_agent_suspends() {
+        let (mut mac, mut pc) = automatic_pair();
+        mac.agent = true;
+        assert!(choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+        pc.agent = true;
+        assert!(!choose_policy("mac", &mac, Some(&pc), Duration::ZERO, &cfg("mac")).emulation);
+    }
     fn cfg(side: &str) -> Settings {
         Settings {
             side: side.into(),

@@ -8,6 +8,11 @@ pub struct Preferences {
     pub local_name: String,
     pub peer_name: String,
     pub input_mode: String,
+    pub auto_monitor: bool,
+    pub auto_local_activity: bool,
+    pub auto_unlock: bool,
+    pub auto_preferred: String,
+    pub auto_idle_seconds: u32,
     pub shared_monitor: bool,
     pub manage_displays: bool,
     pub protect_windows_fullscreen: bool,
@@ -24,6 +29,11 @@ impl Default for Preferences {
             local_name: "Mac".into(),
             peer_name: "Windows".into(),
             input_mode: "edges".into(),
+            auto_monitor: true,
+            auto_local_activity: true,
+            auto_unlock: true,
+            auto_preferred: "mac".into(),
+            auto_idle_seconds: 120,
             shared_monitor: false,
             manage_displays: false,
             protect_windows_fullscreen: true,
@@ -38,8 +48,13 @@ impl Default for Preferences {
 }
 impl Preferences {
     pub fn validate(&self) -> io::Result<()> {
-        if !["edges", "to_mac", "to_pc"].contains(&self.input_mode.as_str()) {
+        if !["edges", "to_mac", "to_pc", "auto"].contains(&self.input_mode.as_str()) {
             return Err(io::Error::other("invalid keyboard and mouse mode"));
+        }
+        if !["mac", "pc"].contains(&self.auto_preferred.as_str())
+            || !(15..=3600).contains(&self.auto_idle_seconds)
+        {
+            return Err(io::Error::other("invalid automatic input options"));
         }
         for (text, maximum) in [
             (&self.local_name, 64),
@@ -55,7 +70,7 @@ impl Preferences {
             return Err(io::Error::other("invalid monitor input"));
         }
         if self.shared_monitor
-            && self.input_mode == "edges"
+            && (self.input_mode == "edges" || (self.input_mode == "auto" && self.auto_monitor))
             && (self.windows_monitor.is_empty()
                 || self.mac_monitor_uuid.is_empty()
                 || self.mac_input == 0

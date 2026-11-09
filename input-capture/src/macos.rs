@@ -620,6 +620,58 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        if source_pid == 0 && input_event::activity::enabled() {
+            // A capture tap can precede the passive observer and suppress the
+            // event. Record only metadata here too; held bits are idempotent.
+            match event_type {
+                CGEventType::KeyDown | CGEventType::KeyUp => input_event::activity::captured_key(
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16,
+                    matches!(event_type, CGEventType::KeyDown),
+                ),
+                CGEventType::FlagsChanged => {
+                    let code =
+                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                    if let Some(down) = mac_modifier_key_down(code, cg_ev.get_flags().bits()) {
+                        input_event::activity::captured_key(code, down);
+                    } else if code == 63 {
+                        input_event::activity::captured_key(
+                            code,
+                            cg_ev
+                                .get_flags()
+                                .contains(CGEventFlags::CGEventFlagSecondaryFn),
+                        );
+                    } else if code == 57 {
+                        input_event::activity::physical_motion();
+                    }
+                }
+                CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+                | CGEventType::RightMouseDown
+                | CGEventType::RightMouseUp
+                | CGEventType::OtherMouseDown
+                | CGEventType::OtherMouseUp => input_event::activity::captured_key(
+                    256 + cg_ev
+                        .get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER)
+                        .clamp(0, 31) as u16,
+                    matches!(
+                        event_type,
+                        CGEventType::LeftMouseDown
+                            | CGEventType::RightMouseDown
+                            | CGEventType::OtherMouseDown
+                    ),
+                ),
+                _ => input_event::activity::physical_motion(),
+            }
+        }
+        if source_pid == 0 && input_event::activity::mac_takeover() {
+            if state.current_pos.take().is_some() {
+                let _ = CGDisplay::show_cursor(&CGDisplay::main());
+            }
+            // Leave the native event on this Mac; the passive listener records
+            // intent and the coordinator releases the previous remote route.
+            return CallbackResult::Keep;
+        }
+
         // A software warp to a screen edge must not turn the user's first
         // physical movement into an unintended crossing to the other host.
         if state.current_pos.is_none()
@@ -906,6 +958,7 @@ fn request_input_monitoring_permission() -> bool {
 
 impl Drop for MacOSInputCapture {
     fn drop(&mut self) {
+        input_event::activity::capture_stopped();
         self.run_loop.stop();
     }
 }

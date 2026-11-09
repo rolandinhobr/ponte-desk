@@ -2262,9 +2262,11 @@ dependencies = [
 
 [[package]]
 name = "ponte-desk"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
+ "core-foundation",
+ "core-graphics",
  "env_logger",
  "futures",
  "hmac",

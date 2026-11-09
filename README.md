@@ -12,6 +12,7 @@ Um aplicativo gratuito e aberto para compartilhar teclado, mouse, webcam externa
 ## Escolha o que compartilhar
 
 - **Teclado e mouse:** use a travessia pelas bordas ou fixe os periféricos dos dois computadores no Mac ou no Windows. No modo fixo, o primeiro movimento ou tecla já vai ao destino, sem trocar telas ou entradas do monitor.
+- **Destino automático:** atividade humana local, desbloqueio e troca estável da entrada do monitor escolhem o computador. O mouse emprestado não puxa o destino de volta; teclas e botões pressionados adiam a troca. [Regras e opções](docs/automatic-input.md).
 - **Webcam externa:** deixe o USB em qualquer um dos computadores e compartilhe quando precisar. Captura em 1080p/30 ou 720p/30 para reduzir o tráfego. A câmera começa desligada.
 - **Cartão SD:** publique uma mídia removível em somente leitura e monte no outro computador pelo Finder ou Explorer. Sem copiar o cartão inteiro antes. [Configuração e limites](docs/storage.md).
 - **Monitor compartilhado, opcional:** para quem alterna a entrada de um mesmo monitor entre os computadores. A configuração identifica o monitor e suas entradas; a automação pode reorganizar as telas do Mac e restaurá-las depois.

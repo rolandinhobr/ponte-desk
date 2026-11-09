@@ -39,3 +39,7 @@ O computador de origem envia apenas teclado e mouse físicos. O destino recebe a
 Agentes e programas no destino usam o cursor e o teclado do sistema normalmente, junto dos acessórios recebidos. Não há um segundo cursor no mesmo desktop. A lease confirma que não existe captura de retorno, sem pausar a recepção física. Se um agente opera a origem, sua lease suspende o envio para impedir que HID virtual seja confundido com acessório físico; eventos sintéticos identificáveis também são filtrados pelo backend.
 
 O atalho de liberação indicado no painel devolve o controle local e pausa o par. **Pausar teclado e mouse** funciona nos dois painéis. Conexão não confirmada em dois segundos, falha no transporte e excesso de transições pendentes liberam a captura; o usuário retoma explicitamente pelo painel. A fila de início é limitada e agrega movimentos sem descartar a primeira tecla ou clique enquanto aguarda a confirmação do destino.
+
+## Destino automático
+
+A quarta opção do seletor de teclado/mouse é **Automático — acompanhar meu uso**. Nos ajustes dos dois painéis você pode ativar ou desativar atividade local, monitor e desbloqueio, e escolher o computador preferido ao iniciar. Veja [as regras de decisão, proteção e privacidade](automatic-input.md). O automático exige atualizar os dois motores e mantém as opções manuais disponíveis.

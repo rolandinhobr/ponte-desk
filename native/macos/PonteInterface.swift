@@ -173,7 +173,7 @@ func buildPontePanel(_ owner: AppDelegate) -> NSWindow {
     owner.permissionsButton=permissions
     permissions.toolTip = "Verificar as permissões de controle deste Mac"
     let inputMode=NSPopUpButton()
-    inputMode.addItems(withTitles:["Passar pelas bordas", "Usar os periféricos dos dois neste Mac", "Usar os periféricos dos dois no Windows"])
+    inputMode.addItems(withTitles:["Passar pelas bordas", "Usar os periféricos dos dois neste Mac", "Usar os periféricos dos dois no Windows", "Automático — acompanhar meu uso"])
     inputMode.target=owner;inputMode.action=#selector(AppDelegate.changeInputMode)
     inputMode.setAccessibilityLabel("Destino do teclado e mouse")
     owner.inputMode=inputMode

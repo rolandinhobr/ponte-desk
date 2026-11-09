@@ -1,7 +1,9 @@
 //! In-process desktop coordination and native hook suspension.
 //! An external policy override is retained for isolated backend tests.
 use serde::Deserialize;
+mod activity;
 pub mod agent;
+mod automatic;
 #[cfg(target_os = "macos")]
 mod macos;
 mod native;

@@ -83,6 +83,8 @@ mod ffi {
         pub fn SetProcessDpiAwarenessContext(context: Handle) -> i32;
         pub fn SetThreadDpiAwarenessContext(context: Handle) -> Handle;
         pub fn GetForegroundWindow() -> Handle;
+        pub fn OpenInputDesktop(flags: u32, inherit: i32, access: u32) -> Handle;
+        pub fn CloseDesktop(desktop: Handle) -> i32;
         pub fn GetAncestor(window: Handle, flags: u32) -> Handle;
         pub fn GetDesktopWindow() -> Handle;
         pub fn GetShellWindow() -> Handle;
@@ -229,7 +231,15 @@ pub fn probe() -> PlatformState {
         cache.refresh = true;
         runtime.wake.notify_one();
     }
+    let desktop = unsafe { ffi::OpenInputDesktop(0, 0, 1) };
+    let locked = desktop.is_null();
+    if !desktop.is_null() {
+        unsafe {
+            ffi::CloseDesktop(desktop);
+        }
+    }
     PlatformState {
+        locked: Some(locked),
         monitor_present: cache.present,
         fullscreen,
         input: cache.input,

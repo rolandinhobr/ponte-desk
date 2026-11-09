@@ -76,8 +76,8 @@ internal sealed class Desk:ApplicationContext {
         content.Dock=DockStyle.Fill;content.FlowDirection=FlowDirection.TopDown;content.WrapContents=false;content.AutoScroll=true;content.Padding=new Padding(24,0,16,16);content.BackColor=Artwork.Background;
         panel.Controls.Add(content);panel.Controls.Add(header);
         input=Button("Pausar teclado e mouse",async()=>{await runtime.Bridge(runtime.Paused);RefreshState();});inputStatus=Label("");
-        inputMode=Combo("Destino do teclado e mouse");inputMode.Items.AddRange(new[]{"Passar pelas bordas","Usar os periféricos dos dois no Mac","Usar os periféricos dos dois neste Windows"});inputMode.SelectedIndex=0;
-        inputMode.SelectedIndexChanged+=async(s,e)=>{if(syncingInputMode||busy)return;await Run(async()=>{await Patch(new Dictionary<string,object>{{"input_mode",new[]{"edges","to_mac","to_pc"}[inputMode.SelectedIndex]}});await runtime.Bridge(true);});};
+        inputMode=Combo("Destino do teclado e mouse");inputMode.Items.AddRange(new[]{"Passar pelas bordas","Usar os periféricos dos dois no Mac","Usar os periféricos dos dois neste Windows","Automático — acompanhar meu uso"});inputMode.SelectedIndex=0;
+        inputMode.SelectedIndexChanged+=async(s,e)=>{if(syncingInputMode||busy)return;await Run(async()=>{await Patch(new Dictionary<string,object>{{"input_mode",new[]{"edges","to_mac","to_pc","auto"}[inputMode.SelectedIndex]}});await runtime.Bridge(true);});};
         Section("Teclado e mouse",inputStatus,inputMode,input,Label("Controle local: Ctrl + Alt + Esc"));
         cameraOrigin=Combo("Computador ao qual a webcam está conectada");cameraOrigin.Items.AddRange(new[]{"Conectada a este PC","Conectada ao Mac"});cameraOrigin.SelectedIndex=0;
         cameras=Combo("Webcam USB externa");quality=Combo("Qualidade da webcam");quality.Items.AddRange(new[]{"1080p · 30 fps","720p · 30 fps"});quality.SelectedIndex=0;quality.Width=190;
@@ -102,13 +102,13 @@ internal sealed class Desk:ApplicationContext {
     private Dictionary<string,object> Options(){return runtime.Read(File.Exists(Path.Combine(runtime.Root,"peer-preferences.json"))?"peer-preferences.json":"preferences.json");}
     private void RefreshState(){
         var engine=runtime.Read("engine-status.json");var options=Options();bool fresh=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()-Json.Number(engine,"timestamp_ms")<6500;
-        if(!busy){syncingInputMode=true;inputMode.SelectedIndex=Array.IndexOf(new[]{"edges","to_mac","to_pc"},Json.Text(options,"input_mode","edges"));if(inputMode.SelectedIndex<0)inputMode.SelectedIndex=0;syncingInputMode=false;}
+        if(!busy){syncingInputMode=true;inputMode.SelectedIndex=Array.IndexOf(new[]{"edges","to_mac","to_pc","auto"},Json.Text(options,"input_mode","edges"));if(inputMode.SelectedIndex<0)inputMode.SelectedIndex=0;syncingInputMode=false;}
         input.Text=runtime.Paused?"Retomar teclado e mouse":"Pausar teclado e mouse";
         inputStatus.Text=runtime.Preview?"Prévia da interface · nenhuma operação real":!fresh?"Motor indisponível. Use Reconectar.":Json.Text(engine,"reason","Aguardando conexão");
         if(!busy)status.Text=feedback??(runtime.Preview?"Prévia da interface":runtime.Paused?"Teclado e mouse em pausa":Json.Flag(engine,"capture_installed")&&fresh?"Pronto para compartilhar":"Controle local protegido");
         if(iconPaused!=runtime.Paused){iconPaused=runtime.Paused;var next=Artwork.Icon(runtime.Paused);tray.Icon=next;if(icon!=null)icon.Dispose();icon=next;panel.Icon=icon;}
         var camera=runtime.Read("webcam-status.json");cameraStatus.Text=Json.Text(camera,"message","Webcam desligada");
-        monitorSection.Visible=Json.Flag(options,"shared_monitor")&&Json.Text(options,"input_mode","edges")=="edges";autoDisplays.Checked=Json.Flag(options,"manage_displays");monitorStatus.Text=Json.Text(engine,"reason");
+        monitorSection.Visible=Json.Flag(options,"shared_monitor")&&(Json.Text(options,"input_mode","edges")=="edges"||Json.Text(options,"input_mode","edges")=="auto");autoDisplays.Checked=Json.Flag(options,"manage_displays");monitorStatus.Text=Json.Text(engine,"reason");
         storageStatus.Text=storage.Message;sdStart.Text=storage.Active?"Montar no destino":"Compartilhar cartão";ControlsState();
     }
     private void ControlsState(){bool free=!busy&&!runtime.Preview;input.Enabled=free;inputMode.Enabled=free;cameraOrigin.Enabled=free;cameras.Enabled=free;cameraStart.Enabled=free&&(Json.Get(Options(),"webcam_enabled")==null||Json.Flag(Options(),"webcam_enabled"));cameraStop.Enabled=free;cardOrigin.Enabled=free&&!storage.Active;cards.Enabled=free&&!storage.Active;sdStart.Enabled=free&&!storage.Pending&&(storage.Active||cards.SelectedItem is Choice);sdStop.Enabled=free&&storage.Active&&!storage.Pending;sdOpen.Enabled=free&&storage.Mounted;sdRefresh.Enabled=free&&!storage.Pending;}

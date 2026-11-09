@@ -221,7 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         statusText?.stringValue=mode();item?.button?.image=PonteArtwork.menuIcon(paused:paused)
         inputSwitch?.state=paused ? .off:.on
         let fixed=(options["input_mode"] as? String ?? "edges") != "edges"
-        if !changingInputMode{inputMode?.selectItem(at:["edges","to_mac","to_pc"].firstIndex(of:options["input_mode"] as? String ?? "edges") ?? 0)}
+        if !changingInputMode{inputMode?.selectItem(at:["edges","to_mac","to_pc","auto"].firstIndex(of:options["input_mode"] as? String ?? "edges") ?? 0)}
         let state=readJSON("observer-status.json"),policy=state["policy"] as? [Any]
         inputState?.stringValue=preview ? "Disponível nos dois sentidos" : policy?.last as? String ?? "Configure o par para começar"
         let permission=preview || (AXIsProcessTrusted() && CGPreflightListenEventAccess())
@@ -230,7 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let directions=["left":"à esquerda","right":"à direita","top":"acima","bottom":"abaixo"]
         layoutLabel?.stringValue="\(peerDisplayName) \(directions[peerPosition] ?? "ao lado")";layoutLabel?.isHidden=fixed
         let shared=options["shared_monitor"] as? Bool == true
-        monitorGroup?.isHidden = !shared || fixed;autoDisplaySwitch?.state=options["manage_displays"] as? Bool == true ? .on:.off
+        monitorGroup?.isHidden = !shared || (fixed && options["input_mode"] as? String != "auto");autoDisplaySwitch?.state=options["manage_displays"] as? Bool == true ? .on:.off
         monitorStatus?.stringValue=policy?.last as? String ?? "Aguardando monitor"
         let cameraEnabled=options["webcam_enabled"] as? Bool != false
         cameraStart?.isEnabled=cameraEnabled && !preview
@@ -240,9 +240,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     @objc func changeInputMode(){
-        guard !preview,!changingInputMode,let peer=cameraPeer,let index=inputMode?.indexOfSelectedItem,index>=0,index<3 else{return}
+        guard !preview,!changingInputMode,let peer=cameraPeer,let index=inputMode?.indexOfSelectedItem,index>=0,index<4 else{return}
         changingInputMode=true;inputMode?.isEnabled=false
-        let selected=["edges","to_mac","to_pc"][index]
+        let selected=["edges","to_mac","to_pc","auto"][index]
         let patch=String(decoding:try! JSONSerialization.data(withJSONObject:["input_mode":selected]),as:UTF8.self)
         command(["settings","update","--patch",patch]){[weak self] result in
             guard let self else{return}
@@ -393,6 +393,10 @@ public func pontePlatformProbe() -> UInt32 {
         guard CGGetActiveDisplayList(32,&ids,&count) == .success else {return 0}
         let active=Array(ids.prefix(Int(count)))
         var result:UInt32=active.contains(where:{MonitorIdentity.matches($0)}) ? 1 : 0
+        if let session=CGSessionCopyCurrentDictionary() as? [String:Any] {
+            result |= 16
+            if session["CGSSessionScreenIsLocked"] as? Bool == true {result |= 8}
+        }
         if !active.isEmpty && active.allSatisfy({CGDisplayIsAsleep($0) != 0}) {result |= 4}
         if let windows=CGWindowListCopyWindowInfo([.optionOnScreenOnly,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]],
            let front=windows.first(where:{($0[kCGWindowLayer as String] as? Int)==0 && ($0[kCGWindowAlpha as String] as? Double ?? 1)>0}),

@@ -177,6 +177,7 @@ fn record_physical_button(event: Option<PointerEvent>) {
             None,
         );
         if let Some(index) = button.checked_sub(BTN_LEFT).filter(|i| *i < 5) {
+            input_event::activity::captured_key(256 + index as u16, state == 1);
             PHYSICAL_BUTTONS.with_borrow(|shared| {
                 if let Some(shared) = shared {
                     if state == 1 {
@@ -233,6 +234,7 @@ struct ThreadResources {
 }
 impl Drop for ThreadResources {
     fn drop(&mut self) {
+        input_event::activity::capture_stopped();
         ACTIVE_CLIENT.set(None);
         PREV_POS.set(None);
         CLIENTS.with_borrow_mut(HashSet::clear);
@@ -484,6 +486,21 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     {
         record_physical_button(to_mouse_event(wparam, lparam));
     }
+    if !crate::input_origin::windows_mouse_is_software(event.flags)
+        && !matches!(
+            wparam.0 as u32,
+            WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+                | WM_XBUTTONDOWN
+                | WM_XBUTTONUP
+        )
+    {
+        input_event::activity::physical_motion();
+    }
     if DIRECT_CLIENT.get().is_some() {
         let mut point = POINT::default();
         if GetCursorPos(&mut point).is_err() {
@@ -533,6 +550,12 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     {
         crate::input_origin::record_software_event();
         return CallNextHookEx(None, ncode, wparam, lparam);
+    }
+    if !crate::input_origin::windows_key_is_software(event.flags.0) {
+        input_event::activity::captured_key(
+            (event.vkCode & 255) as u16,
+            matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN),
+        );
     }
     /* get active client if any */
     activate_direct();

@@ -28,6 +28,7 @@ pub fn probe() -> PlatformState {
         monitor_present: bits & 1 != 0,
         fullscreen: bits & 2 != 0,
         asleep: bits & 4 != 0,
+        locked: (bits & 16 != 0).then_some(bits & 8 != 0),
         input: None,
         input_age_ms: None,
     }
