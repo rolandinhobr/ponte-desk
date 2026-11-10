@@ -93,7 +93,9 @@ impl Selector {
             }
             self.locked[i] = state.platform.locked;
         }
-        if options.auto_monitor
+        let inhibited = mac.agent || pc.agent || mac.manual_pause || pc.manual_pause;
+        if !inhibited
+            && options.auto_monitor
             && options.shared_monitor
             && pc.platform.input_age_ms.is_some_and(|age| age < 12000)
         {
@@ -130,7 +132,7 @@ impl Selector {
             self.monitor_candidate = None;
         }
         // Do not decide while either desktop is under agent control or paused.
-        if mac.agent || pc.agent || mac.manual_pause || pc.manual_pause {
+        if inhibited {
             request = None;
             self.pending = None;
         }
@@ -232,6 +234,26 @@ mod tests {
         assert_eq!(x.update(20000, &p, &m, &pc).target, "mac");
         m.activity.as_mut().unwrap().held = false;
         assert_eq!(x.update(21000, &p, &m, &pc).target, "mac");
+    }
+    #[test]
+    fn monitor_change_while_paused_is_reconsidered_after_resume() {
+        let (mut p, m, mut pc) = pair();
+        p.shared_monitor = true;
+        p.auto_monitor = true;
+        p.mac_input = 19;
+        p.pc_input = 15;
+        pc.platform.input = Some(15);
+        pc.platform.input_age_ms = Some(0);
+        let mut x = Selector::default();
+        x.update(2000, &p, &m, &pc);
+        assert_eq!(x.update(3500, &p, &m, &pc).target, "pc");
+        pc.manual_pause = true;
+        pc.platform.input = Some(19);
+        x.update(5000, &p, &m, &pc);
+        assert_eq!(x.update(7000, &p, &m, &pc).target, "pc");
+        pc.manual_pause = false;
+        x.update(8000, &p, &m, &pc);
+        assert_eq!(x.update(9500, &p, &m, &pc).target, "mac");
     }
     #[test]
     fn first_click_after_unlock_remains_local_through_its_release() {

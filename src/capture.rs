@@ -60,7 +60,10 @@ pub(crate) enum CaptureType {
 
 #[derive(Clone, Debug)]
 enum CaptureRequest {
-    Direct(bool),
+    Direct {
+        enabled: bool,
+        automatic: bool,
+    },
     /// capture must release the mouse
     Release,
     /// add a capture client
@@ -87,6 +90,8 @@ impl Capture {
         let capture_task = CaptureTask {
             active_client: None,
             direct: false,
+            automatic: false,
+            retry_direct_at: None,
             pending_direct: VecDeque::new(),
             button_sync_clients: HashSet::new(),
             button_serial: crate::integration::now_ms() as u32,
@@ -117,8 +122,10 @@ impl Capture {
             .expect("channel closed");
     }
 
-    pub(crate) fn direct(&self, value: bool) {
-        let _ = self.request_tx.send(CaptureRequest::Direct(value));
+    pub(crate) fn direct(&self, enabled: bool, automatic: bool) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::Direct { enabled, automatic });
     }
 
     pub(crate) fn suspend(&self, suspended: bool) {
@@ -187,6 +194,8 @@ macro_rules! debounce {
 
 struct CaptureTask {
     direct: bool,
+    automatic: bool,
+    retry_direct_at: Option<Instant>,
     pending_direct: VecDeque<Event>,
     button_sync_clients: HashSet<CaptureHandle>,
     button_serial: u32,
@@ -245,12 +254,16 @@ impl CaptureTask {
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
-                        CaptureRequest::Direct(value)=>{self.direct=value;},
-                        CaptureRequest::Reenable if !self.suspended => break,
+                        CaptureRequest::Direct { enabled, automatic }=>{
+                            if enabled!=self.direct || automatic!=self.automatic {self.retry_direct_at=None;}
+                            self.direct=enabled;self.automatic=automatic;
+                        },
+                        CaptureRequest::Reenable if !self.suspended && self.retry_direct_at.is_none() => break,
                         CaptureRequest::Reenable => {},
                         CaptureRequest::Suspend(value) => {
                             self.suspended = value;
-                            if !value { break; }
+                            if value { self.retry_direct_at=None; }
+                            else if self.retry_direct_at.is_none() { break; }
                         },
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
@@ -258,6 +271,11 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                    },
+                    _ = tokio::time::sleep_until(self.retry_direct_at.unwrap_or_else(Instant::now).into()),
+                        if !self.suspended && self.retry_direct_at.is_some() => {
+                        self.retry_direct_at=None;
+                        break;
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -306,7 +324,7 @@ impl CaptureTask {
     }
 
     async fn apply_direct(&self, capture: &mut InputCapture) -> Result<(), CaptureError> {
-        let handle = if self.direct {
+        let handle = if self.direct && self.retry_direct_at.is_none() {
             self.captures
                 .iter()
                 .find(|(_, _, t)| *t == CaptureType::Default)
@@ -327,6 +345,26 @@ impl CaptureTask {
                 b"direct input released",
             );
         }
+    }
+
+    // Only the user's release chord (or a fixed-mode failure) is sticky.
+    // An automatic handoff can turn the old receiver off before its sender
+    // learns the new policy. Release immediately, and allow the coordinator
+    // to suspend this route before considering another native capture.
+    async fn release_interrupted(
+        &mut self,
+        capture: &mut InputCapture,
+    ) -> Result<(), CaptureError> {
+        let retry = self.direct && self.automatic;
+        if !retry {
+            self.pause_direct();
+        }
+        self.release_capture(capture).await?;
+        if retry {
+            // Longer than the coordinator's peer freshness window (6 s).
+            self.retry_direct_at = Some(Instant::now() + Duration::from_secs(7));
+        }
+        Ok(())
     }
 
     async fn send_input(
@@ -367,6 +405,7 @@ impl CaptureTask {
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
         let mut handshake = tokio::time::interval(Duration::from_millis(250));
+        handshake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buttons = tokio::time::interval(Duration::from_millis(100));
         buttons.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -376,13 +415,13 @@ impl CaptureTask {
                     let event=if self.button_sync_clients.contains(&handle) {
                         ProtoEvent::PointerButtons {serial:self.button_serial,mask:self.button_mask}
                     } else { ProtoEvent::ButtonSync };
-                    if self.conn.send(event,handle).await.is_err(){self.pause_direct();self.release_capture(capture).await?;}
+                    if self.conn.send(event,handle).await.is_err(){self.release_interrupted(capture).await?;}
                 },
                 _=handshake.tick(), if self.direct && self.waiting_since.is_some()=>{
                     if self.waiting_since.is_some_and(|t|t.elapsed()>Duration::from_secs(2)) {
-                        self.pause_direct();self.release_capture(capture).await?;
+                        self.release_interrupted(capture).await?;
                     } else if let Some(handle)=self.active_client {
-                        if let Err(error)=self.conn.send(ProtoEvent::Enter(to_proto_pos(self.get_pos(handle).opposite())),handle).await{if !matches!(error,LanMouseConnectionError::NotConnected|LanMouseConnectionError::TargetEmulationDisabled){self.pause_direct();self.release_capture(capture).await?;}}
+                        if let Err(error)=self.conn.send(ProtoEvent::Enter(to_proto_pos(self.get_pos(handle).opposite())),handle).await{if !matches!(error,LanMouseConnectionError::NotConnected|LanMouseConnectionError::TargetEmulationDisabled){self.release_interrupted(capture).await?;}}
                     }
                 },
                 event = capture.next() => match event {
@@ -405,19 +444,19 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;self.waiting_since=None;
                             while let Some(event)=self.pending_direct.pop_front(){
-                                if self.send_input(event,handle).await.is_err(){self.pause_direct();self.release_capture(capture).await?;break;}
+                                if self.send_input(event,handle).await.is_err(){self.release_interrupted(capture).await?;break;}
                             }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.pause_direct();self.release_capture(capture).await?;
+                            self.release_interrupted(capture).await?;
                         },
                         _ => {}
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    CaptureRequest::Direct(value)=>{if value!=self.direct{self.release_capture(capture).await?;self.direct=value;self.apply_direct(capture).await?;}},
+                    CaptureRequest::Direct { enabled, automatic }=>{if enabled!=self.direct || automatic!=self.automatic {self.release_capture(capture).await?;self.direct=enabled;self.automatic=automatic;self.apply_direct(capture).await?;}},
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Suspend(true) => {
                         self.suspended = true;
@@ -425,7 +464,7 @@ impl CaptureTask {
                         return Ok(());
                     },
                     CaptureRequest::Suspend(false) => {},
-                    CaptureRequest::Release => {self.pause_direct();self.release_capture(capture).await?;},
+                    CaptureRequest::Release => {self.release_interrupted(capture).await?;},
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -450,6 +489,11 @@ impl CaptureTask {
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,
+            }
+            if self.retry_direct_at.is_some() {
+                // Remove the native hook during recovery, including its edge
+                // barriers. Passthrough must be genuine local control.
+                return Ok(());
             }
         }
         Ok(())
@@ -507,8 +551,7 @@ impl CaptureTask {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck if self.direct => {
                     if !queue_direct(&mut self.pending_direct, e) {
-                        self.pause_direct();
-                        return self.release_capture(capture).await;
+                        return self.release_interrupted(capture).await;
                     }
                     return Ok(());
                 }
@@ -538,8 +581,7 @@ impl CaptureTask {
             // fires and active_client is cleared (without this the
             // active_client field would stay stale until the next
             // Begin from a different handle).
-            self.pause_direct();
-            self.release_capture(capture).await?;
+            self.release_interrupted(capture).await?;
         }
         Ok(())
     }
@@ -547,6 +589,7 @@ impl CaptureTask {
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         self.pending_direct.clear();
         self.waiting_since = None;
+        self.retry_direct_at = None;
         if self.direct {
             capture.direct(None).await?;
             let _ = self.event_tx.send(ICaptureEvent::DirectMode(false));

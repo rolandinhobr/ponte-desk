@@ -37,6 +37,8 @@ pub(crate) struct Policy {
     pub capture: bool,
     #[serde(default)]
     pub direct: bool,
+    #[serde(default)]
+    pub automatic: bool,
     pub emulation: bool,
     pub reason: String,
     pub expires_ms: u64,
@@ -47,6 +49,7 @@ impl Policy {
         Self {
             capture: false,
             direct: false,
+            automatic: false,
             emulation: false,
             reason: reason.into(),
             expires_ms: 0,
@@ -109,6 +112,7 @@ impl Guard {
             None => Policy {
                 capture: false,
                 direct: false,
+                automatic: false,
                 emulation: false,
                 reason: "aguardando conexão integrada".into(),
                 expires_ms: 0,
@@ -141,7 +145,8 @@ impl Guard {
         } else {
             return false;
         };
-        let changed = self.policy.direct != policy.direct
+        let changed = self.policy.automatic != policy.automatic
+            || self.policy.direct != policy.direct
             || self.policy.capture != policy.capture
             || self.policy.emulation != policy.emulation
             || self.policy.reason != policy.reason;

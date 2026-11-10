@@ -106,7 +106,7 @@ impl Service {
             config.release_bind(),
             !integration.policy.capture,
         );
-        capture.direct(integration.policy.direct);
+        capture.direct(integration.policy.direct, integration.policy.automatic);
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener, !integration.policy.emulation);
 
@@ -169,7 +169,7 @@ impl Service {
                     if stop.exists() { let _=std::fs::remove_file(stop); break; }
                     let changed = self.integration.refresh();
                     if changed {
-                        self.capture.direct(self.integration.policy.direct);
+                        self.capture.direct(self.integration.policy.direct, self.integration.policy.automatic);
                         log::info!("integration: {}", self.integration.policy.reason);
                         self.capture.suspend(!self.integration.policy.capture);
                         self.emulation.suspend(!self.integration.policy.emulation);

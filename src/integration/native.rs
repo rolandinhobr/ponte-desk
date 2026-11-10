@@ -290,6 +290,7 @@ pub fn choose_policy(
             capture: !receiving && peer.emulation && !peer.capture && !local.emulation,
             emulation: receiving,
             direct: !receiving,
+            automatic: auto,
             reason: auto_reason.unwrap_or_else(|| {
                 if receiving {
                     "Periféricos do outro computador conectados aqui"
@@ -311,6 +312,7 @@ pub fn choose_policy(
         return Policy {
             capture,
             direct: false,
+            automatic: false,
             emulation: true,
             reason: if capture {
                 "Teclado e mouse disponíveis"
@@ -343,6 +345,7 @@ pub fn choose_policy(
     Policy {
         capture,
         direct: false,
+        automatic: false,
         emulation,
         reason: reason.into(),
         expires_ms: now_ms() + 8_000,
