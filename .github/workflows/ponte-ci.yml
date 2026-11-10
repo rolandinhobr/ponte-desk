@@ -26,7 +26,7 @@ jobs:
         run: cargo build --release --no-default-features -j 1
       - name: Compile macOS interface
         if: runner.os == 'macOS'
-        run: swiftc -warnings-as-errors -emit-library -O native/macos/PonteDesk.swift native/macos/PonteInterface.swift native/macos/PonteArtwork.swift native/macos/PonteSettings.swift native/macos/CameraComponent.swift native/macos/WebcamCapture.swift native/macos/WebcamSink.swift -o /tmp/PonteDeskUI.dylib -framework AppKit -framework ApplicationServices -framework AVFoundation -framework VideoToolbox -framework CoreMediaIO -framework CoreMedia -framework CoreVideo -framework ImageIO
+        run: swiftc -warnings-as-errors -emit-library -O native/macos/PonteDesk.swift native/macos/PonteInterface.swift native/macos/PonteArtwork.swift native/macos/PonteSettings.swift native/macos/PonteStorage.swift native/macos/StorageNative.swift native/macos/storage/StorageProtocol.swift native/macos/storage/StorageVolumes.swift native/macos/CameraComponent.swift native/macos/WebcamCapture.swift native/macos/WebcamSink.swift -o /tmp/PonteDeskUI.dylib -framework AppKit -framework ApplicationServices -framework AVFoundation -framework VideoToolbox -framework CoreMediaIO -framework CoreMedia -framework CoreVideo -framework ImageIO -framework DiskArbitration -framework NetFS -framework Security -framework ServiceManagement
       - name: Coordinator smoke test
         if: runner.os == 'macOS'
         run: python3 tests/coordinator_smoke.py target/release/ponte-desk
@@ -34,3 +34,25 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./native/windows/webcam/build.ps1
+      - name: Compile macOS storage helper
+        if: runner.os == 'macOS'
+        run: swiftc -warnings-as-errors -O -parse-as-library native/macos/storage/StorageProtocol.swift native/macos/storage/StorageVolumes.swift native/macos/storage/StorageHelper.swift -o /tmp/ponte-storage-helper -framework DiskArbitration -framework Security
+      - name: Build Windows storage
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./native/windows/storage/build.ps1
+      - name: Storage interface state machine
+        if: runner.os == 'macOS'
+        run: |
+          swiftc -warnings-as-errors native/macos/PonteStorage.swift tests/storage_ui.swift -o /tmp/ponte-storage-ui -framework AppKit -framework ServiceManagement
+          /tmp/ponte-storage-ui
+      - name: Storage lifecycle without hardware
+        if: runner.os == 'macOS'
+        run: python3 tests/storage_lifecycle.py target/release/ponte-desk
+      - name: Build Windows application and interface checks
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./native/windows/app/build.ps1
+      - name: macOS explicit quit with blocked operation
+        if: runner.os == 'macOS'
+        run: ./scripts/test-macos-exit.sh

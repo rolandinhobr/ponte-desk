@@ -1,10 +1,13 @@
 //! In-process desktop coordination and native hook suspension.
 //! An external policy override is retained for isolated backend tests.
 use serde::Deserialize;
+mod activity;
 pub mod agent;
+mod automatic;
 #[cfg(target_os = "macos")]
 mod macos;
 mod native;
+mod probe;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -32,6 +35,10 @@ use std::{
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct Policy {
     pub capture: bool,
+    #[serde(default)]
+    pub direct: bool,
+    #[serde(default)]
+    pub automatic: bool,
     pub emulation: bool,
     pub reason: String,
     pub expires_ms: u64,
@@ -41,6 +48,8 @@ impl Policy {
     fn local(reason: &str) -> Self {
         Self {
             capture: false,
+            direct: false,
+            automatic: false,
             emulation: false,
             reason: reason.into(),
             expires_ms: 0,
@@ -73,8 +82,11 @@ pub(crate) struct Guard {
     coordinator: Option<native::Coordinator>,
     status_root: Option<PathBuf>,
     pub policy: Policy,
+    pub direct_active: bool,
     last_status: Instant,
     last_ignored_software: u64,
+    status_writer: probe::BackgroundWriter<(PathBuf, serde_json::Value)>,
+    status_pending: bool,
 }
 
 impl Guard {
@@ -99,6 +111,8 @@ impl Guard {
             Some(path) => read_policy(path, now_ms()),
             None => Policy {
                 capture: false,
+                direct: false,
+                automatic: false,
                 emulation: false,
                 reason: "aguardando conexão integrada".into(),
                 expires_ms: 0,
@@ -109,8 +123,17 @@ impl Guard {
             coordinator,
             status_root,
             policy,
+            direct_active: false,
             last_status: Instant::now() - Duration::from_secs(6),
             last_ignored_software: 0,
+            status_writer: probe::BackgroundWriter::new(
+                "engine-status",
+                |(root, status): (PathBuf, serde_json::Value)| {
+                    let _ = native::atomic_json(&root.join("engine-status.json"), &status);
+                },
+            )
+            .expect("status worker"),
+            status_pending: true,
         }
     }
 
@@ -122,7 +145,9 @@ impl Guard {
         } else {
             return false;
         };
-        let changed = self.policy.capture != policy.capture
+        let changed = self.policy.automatic != policy.automatic
+            || self.policy.direct != policy.direct
+            || self.policy.capture != policy.capture
             || self.policy.emulation != policy.emulation
             || self.policy.reason != policy.reason;
         self.policy = policy;
@@ -131,34 +156,33 @@ impl Guard {
 
     pub fn write_status(&mut self, capture: bool, emulation: bool, force: bool) {
         if let Some(coordinator) = self.coordinator.as_mut() {
-            coordinator.actual(capture, emulation);
+            coordinator.actual(capture, emulation, self.direct_active);
         }
         let Some(root) = self.status_root.as_ref() else {
             return;
         };
         let ignored = input_capture::input_origin::ignored_software_events();
         if !force
+            && !self.status_pending
             && ignored == self.last_ignored_software
             && self.last_status.elapsed() < Duration::from_secs(5)
         {
             return;
         }
-        self.last_ignored_software = ignored;
-        self.last_status = Instant::now();
         let status = serde_json::json!({
             "timestamp_ms": now_ms(), "pid": std::process::id(),
-            "capture_installed": capture, "emulation_enabled": emulation,
+            "capture_installed": capture, "emulation_enabled": emulation, "direct_active": self.direct_active,
             "reason": self.policy.reason,
             "ignored_software_events": ignored,
+            "button_diagnostics": input_event::button_diagnostics::snapshot(),
+            "native_input": input_emulation::native_performance().map(|p| serde_json::json!({
+                "requests":p.requests,"max_native_us":p.max_native_us,"max_round_trip_us":p.max_round_trip_us
+            })),
         });
-        {
-            let parent = root;
-            let tmp = parent.join("engine-status.json.tmp");
-            if let Ok(data) = serde_json::to_vec(&status) {
-                if fs::write(&tmp, data).is_ok() {
-                    let _ = fs::rename(tmp, parent.join("engine-status.json"));
-                }
-            }
+        self.status_pending = !self.status_writer.submit((root.clone(), status));
+        if !self.status_pending {
+            self.last_ignored_software = ignored;
+            self.last_status = Instant::now();
         }
     }
 }
@@ -178,7 +202,11 @@ pub(crate) fn monitor_catalog() -> serde_json::Value {
     {
         windows::monitor_catalog()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::monitor_catalog()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         serde_json::json!({"monitors":[]})
     }

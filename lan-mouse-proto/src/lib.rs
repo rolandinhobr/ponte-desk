@@ -72,6 +72,10 @@ pub enum ProtoEvent {
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
     Hello { commit: [u8; 8] },
+    /// Capability request/response. Appended IDs retain compatibility with old peers.
+    ButtonSync,
+    /// Complete five-button state; sequence rejects duplicated/reordered datagrams.
+    PointerButtons { serial: u32, mask: u8 },
 }
 
 impl Display for ProtoEvent {
@@ -89,6 +93,8 @@ impl Display for ProtoEvent {
                     if *alive { "alive" } else { "not available" }
                 )
             }
+            ProtoEvent::ButtonSync => write!(f, "ButtonSync"),
+            ProtoEvent::PointerButtons { serial, .. } => write!(f, "PointerButtons({serial})"),
             ProtoEvent::Hello { commit } => {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
@@ -112,6 +118,8 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    ButtonSync,
+    PointerButtons,
 }
 
 impl ProtoEvent {
@@ -135,6 +143,8 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::ButtonSync => EventType::ButtonSync,
+            ProtoEvent::PointerButtons { .. } => EventType::PointerButtons,
         }
     }
 }
@@ -184,6 +194,11 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                     group: decode_u32(&mut buf)?,
                 },
             ))),
+            EventType::ButtonSync => Ok(Self::ButtonSync),
+            EventType::PointerButtons => Ok(Self::PointerButtons {
+                serial: decode_u32(&mut buf)?,
+                mask: decode_u8(&mut buf)?,
+            }),
             EventType::Ping => Ok(Self::Ping),
             EventType::Pong => Ok(Self::Pong(decode_u8(&mut buf)? != 0)),
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
@@ -255,6 +270,11 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                         }
                     },
                 },
+                ProtoEvent::ButtonSync => {}
+                ProtoEvent::PointerButtons { serial, mask } => {
+                    encode_u32(buf, len, serial);
+                    encode_u8(buf, len, mask);
+                }
                 ProtoEvent::Ping => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
@@ -307,3 +327,25 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod button_protocol_tests {
+    use super::*;
+    #[test]
+    fn button_sync_is_append_only_and_bounded() {
+        assert_eq!(u8::from(EventType::Hello), 11);
+        for (serial, mask) in [(0, 0), (u32::MAX, 31), (42, 1)] {
+            let (bytes, len) = ProtoEvent::PointerButtons { serial, mask }.into();
+            assert_eq!(len, 6);
+            assert!(
+                matches!(ProtoEvent::try_from(bytes).unwrap(), ProtoEvent::PointerButtons { serial: s, mask: m } if s==serial && m==mask)
+            );
+        }
+        let (bytes, len) = ProtoEvent::ButtonSync.into();
+        assert_eq!(len, 1);
+        assert!(matches!(
+            ProtoEvent::try_from(bytes).unwrap(),
+            ProtoEvent::ButtonSync
+        ));
+    }
+}

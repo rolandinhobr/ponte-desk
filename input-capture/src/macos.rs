@@ -81,6 +81,7 @@ struct InputCaptureState {
     active_clients: Lazy<HashSet<Position>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
+    direct_pos: Option<Position>,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
     /// bounds of the input capture area
@@ -92,6 +93,7 @@ struct InputCaptureState {
 
 #[derive(Debug)]
 enum ProducerEvent {
+    Direct(Option<Position>),
     Release,
     Create(Position),
     Destroy(Position),
@@ -105,6 +107,7 @@ impl InputCaptureState {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
+            direct_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
@@ -187,6 +190,9 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
+            ProducerEvent::Direct(pos) => {
+                self.direct_pos = pos;
+            }
             ProducerEvent::Release => {
                 if self.current_pos.is_some() {
                     self.show_cursor()?;
@@ -614,6 +620,58 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        if source_pid == 0 && input_event::activity::enabled() {
+            // A capture tap can precede the passive observer and suppress the
+            // event. Record only metadata here too; held bits are idempotent.
+            match event_type {
+                CGEventType::KeyDown | CGEventType::KeyUp => input_event::activity::captured_key(
+                    cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16,
+                    matches!(event_type, CGEventType::KeyDown),
+                ),
+                CGEventType::FlagsChanged => {
+                    let code =
+                        cg_ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                    if let Some(down) = mac_modifier_key_down(code, cg_ev.get_flags().bits()) {
+                        input_event::activity::captured_key(code, down);
+                    } else if code == 63 {
+                        input_event::activity::captured_key(
+                            code,
+                            cg_ev
+                                .get_flags()
+                                .contains(CGEventFlags::CGEventFlagSecondaryFn),
+                        );
+                    } else if code == 57 {
+                        input_event::activity::physical_motion();
+                    }
+                }
+                CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+                | CGEventType::RightMouseDown
+                | CGEventType::RightMouseUp
+                | CGEventType::OtherMouseDown
+                | CGEventType::OtherMouseUp => input_event::activity::captured_key(
+                    256 + cg_ev
+                        .get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER)
+                        .clamp(0, 31) as u16,
+                    matches!(
+                        event_type,
+                        CGEventType::LeftMouseDown
+                            | CGEventType::RightMouseDown
+                            | CGEventType::OtherMouseDown
+                    ),
+                ),
+                _ => input_event::activity::physical_motion(),
+            }
+        }
+        if source_pid == 0 && input_event::activity::mac_takeover() {
+            if state.current_pos.take().is_some() {
+                let _ = CGDisplay::show_cursor(&CGDisplay::main());
+            }
+            // Leave the native event on this Mac; the passive listener records
+            // intent and the coordinator releases the previous remote route.
+            return CallbackResult::Keep;
+        }
+
         // A software warp to a screen edge must not turn the user's first
         // physical movement into an unintended crossing to the other host.
         if state.current_pos.is_none()
@@ -631,6 +689,21 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        // Synthetic events already returned above. A key can begin a fixed route.
+        if state.current_pos.is_none() {
+            if let Some(pos) = state
+                .direct_pos
+                .filter(|p| state.active_clients.contains(p))
+            {
+                if state.start_capture(cg_ev, pos).is_err() {
+                    state.direct_pos = None;
+                    return CallbackResult::Keep;
+                }
+                state.current_pos = Some(pos);
+                let _ = state.hide_cursor();
+                res_events.push(CaptureEvent::Begin);
+            }
+        }
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
@@ -885,12 +958,18 @@ fn request_input_monitoring_permission() -> bool {
 
 impl Drop for MacOSInputCapture {
     fn drop(&mut self) {
+        input_event::activity::capture_stopped();
         self.run_loop.stop();
     }
 }
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
+    fn direct(&mut self, pos: Option<Position>) -> Result<(), CaptureError> {
+        self.notify_tx
+            .try_send(ProducerEvent::Direct(pos))
+            .map_err(|_| CaptureError::ActivationClosed)
+    }
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {

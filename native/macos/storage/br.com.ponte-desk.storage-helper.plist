@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>br.com.ponte-desk.storage-helper</string>
+<key>BundleProgram</key><string>Contents/MacOS/ponte-storage-helper</string>
+<key>MachServices</key><dict><key>br.com.ponte-desk.storage-helper</key><true/></dict>
+<key>AssociatedBundleIdentifiers</key><array><string>br.com.ponte-desk.app</string></array>
+<key>ProcessType</key><string>Adaptive</string>
+<key>ExitTimeOut</key><integer>5</integer>
+</dict></plist>

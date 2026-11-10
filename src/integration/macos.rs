@@ -28,7 +28,45 @@ pub fn probe() -> PlatformState {
         monitor_present: bits & 1 != 0,
         fullscreen: bits & 2 != 0,
         asleep: bits & 4 != 0,
+        locked: (bits & 16 != 0).then_some(bits & 8 != 0),
         input: None,
         input_age_ms: None,
+    }
+}
+
+pub fn monitor_catalog() -> serde_json::Value {
+    unsafe {
+        let load = || -> Option<serde_json::Value> {
+            let path = std::env::current_exe()
+                .ok()?
+                .parent()?
+                .join("../Frameworks/PonteDeskUI.dylib");
+            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+            let lib = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+            if lib.is_null() {
+                return None;
+            }
+            let symbol = libc::dlsym(lib, c"ponte_monitor_catalog_json".as_ptr());
+            let result = if symbol.is_null() {
+                None
+            } else {
+                let call = std::mem::transmute::<
+                    *mut libc::c_void,
+                    unsafe extern "C" fn() -> *mut libc::c_char,
+                >(symbol);
+                let data = call();
+                if data.is_null() {
+                    None
+                } else {
+                    let value =
+                        serde_json::from_slice(std::ffi::CStr::from_ptr(data).to_bytes()).ok();
+                    libc::free(data.cast());
+                    value
+                }
+            };
+            libc::dlclose(lib);
+            result
+        };
+        load().unwrap_or_else(|| serde_json::json!({"monitors":[]}))
     }
 }

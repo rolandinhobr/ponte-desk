@@ -173,6 +173,18 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Fix physical input to one existing client without entering a screen edge.
+    pub async fn direct(&mut self, handle: Option<CaptureHandle>) -> Result<(), CaptureError> {
+        let pos = handle
+            .map(|id| {
+                self.id_map.get(&id).copied().ok_or_else(|| {
+                    CaptureError::Io(std::io::Error::other("direct input client missing"))
+                })
+            })
+            .transpose()?;
+        self.capture.direct(pos)
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -280,6 +292,14 @@ impl Stream for InputCapture {
 
 #[async_trait]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
+    fn direct(&mut self, pos: Option<Position>) -> Result<(), CaptureError> {
+        if pos.is_some() {
+            return Err(CaptureError::Io(std::io::Error::other(
+                "direct input is not supported by this backend",
+            )));
+        }
+        Ok(())
+    }
     /// create a new client with the given id
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
 

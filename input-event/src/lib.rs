@@ -1,5 +1,7 @@
 use std::fmt::{self, Display};
 
+pub mod activity;
+pub mod button_diagnostics;
 pub mod error;
 pub mod scancode;
 

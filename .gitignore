@@ -23,3 +23,14 @@ preferences.json
 peer-preferences.json
 agent-leases/
 *.log
+
+# Reproducible native component outputs
+native/windows/*/build/
+native/windows/*/deps/
+*.obj
+*.lib
+*.exp
+*.dll
+*.exe
+storage-*.json
+storage-stop-*

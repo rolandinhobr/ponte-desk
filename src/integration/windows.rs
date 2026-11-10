@@ -216,6 +216,45 @@ pub fn start_monitor_probe() {
     });
 }
 
+#[link(name = "wtsapi32", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn WTSQuerySessionInformationW(
+        server: Handle,
+        session: u32,
+        class: u32,
+        buffer: *mut *mut u16,
+        bytes: *mut u32,
+    ) -> i32;
+    fn WTSFreeMemory(buffer: Handle);
+}
+fn session_locked() -> Option<bool> {
+    let mut buffer = null_mut();
+    let mut bytes = 0;
+    let ok =
+        unsafe { WTSQuerySessionInformationW(null_mut(), u32::MAX, 25, &mut buffer, &mut bytes) };
+    if ok == 0 || buffer.is_null() {
+        return None;
+    }
+    // Win64 WTSINFOEX: level DWORD, union aligned to 8, then session ID,
+    // connection state, and session flags. Only read the bounded prefix.
+    let result = if bytes >= 20 {
+        let p = buffer.cast::<u8>();
+        let level = unsafe { std::ptr::read_unaligned(p.cast::<u32>()) };
+        let flags = unsafe { std::ptr::read_unaligned(p.add(16).cast::<i32>()) };
+        (level == 1).then_some(flags).and_then(|v| match v {
+            0 => Some(true),
+            1 => Some(false),
+            _ => None,
+        })
+    } else {
+        None
+    };
+    unsafe {
+        WTSFreeMemory(buffer.cast());
+    }
+    result
+}
+
 /// Fast foreground snapshot. DDC never runs on this calling thread.
 pub fn probe() -> PlatformState {
     start_monitor_probe();
@@ -229,7 +268,9 @@ pub fn probe() -> PlatformState {
         cache.refresh = true;
         runtime.wake.notify_one();
     }
+    let locked = session_locked();
     PlatformState {
+        locked,
         monitor_present: cache.present,
         fullscreen,
         input: cache.input,
@@ -462,9 +503,15 @@ fn scan_monitors(target: String, listing: bool) -> MonitorScan {
 pub fn monitor_catalog() -> serde_json::Value {
     serde_json::json!({"monitors":scan_monitors(String::new(),true).catalog})
 }
+fn monitor_probe_requested(options: &crate::preferences::Preferences) -> bool {
+    options.shared_monitor
+        && !options.windows_monitor.is_empty()
+        && (options.input_mode == "edges"
+            || (options.input_mode == "auto" && (options.auto_monitor || options.manage_displays)))
+}
 fn read_monitor_input() -> DdcSample {
     let options = crate::preferences::Preferences::load(&super::native::root());
-    if !options.shared_monitor || options.windows_monitor.is_empty() {
+    if !monitor_probe_requested(&options) {
         return DdcSample::default();
     }
     scan_monitors(options.windows_monitor, false).sample
@@ -506,6 +553,26 @@ fn monitor_worker() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_monitor_worker_is_enabled_and_optional_without_changing_fixed_modes() {
+        let mut p = crate::preferences::Preferences {
+            input_mode: "auto".into(),
+            shared_monitor: true,
+            windows_monitor: "test-monitor".into(),
+            ..Default::default()
+        };
+        assert!(monitor_probe_requested(&p));
+        p.auto_monitor = false;
+        assert!(!monitor_probe_requested(&p));
+        p.manage_displays = true;
+        assert!(monitor_probe_requested(&p));
+        p.input_mode = "to_mac".into();
+        assert!(!monitor_probe_requested(&p));
+        p.input_mode = "edges".into();
+        assert!(monitor_probe_requested(&p));
+        p.shared_monitor = false;
+        assert!(!monitor_probe_requested(&p));
+    }
     fn monitor() -> Rect {
         Rect {
             left: 0,

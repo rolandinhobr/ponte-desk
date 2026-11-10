@@ -13,6 +13,10 @@ final class PonteSettingsController: NSWindowController, NSWindowDelegate {
     private let position = NSPopUpButton()
     private let protectWindows = NSSwitch()
     private let protectMac = NSSwitch()
+    private let autoActivity = NSSwitch()
+    private let autoMonitor = NSSwitch()
+    private let autoUnlock = NSSwitch()
+    private let autoPreferred = NSPopUpButton()
     private let webcam = NSSwitch()
     private let shared = NSSwitch()
     private let manageDisplays = NSSwitch()
@@ -149,6 +153,17 @@ final class PonteSettingsController: NSWindowController, NSWindowDelegate {
             switchRow(protectMac, title: "Manter o cursor no Mac em tela cheia",
                       explanation: "Impede que o cursor saia deste Mac. O outro computador ainda pode controlar o Mac.")
         ])
+        autoPreferred.addItems(withTitles:["Mac", "Windows"])
+        let automaticInput = section("Destino automático", [
+            switchRow(autoActivity, title: "Atividade local assume o controle",
+                explanation: "Usar o teclado ou trackpad do Mac traz os periféricos para ele. O mouse emprestado não troca o destino de volta."),
+            switchRow(autoMonitor, title: "Acompanhar a entrada do monitor compartilhado",
+                explanation: "Uma mudança estável da entrada indica o novo destino. Exige o monitor calibrado abaixo."),
+            switchRow(autoUnlock, title: "Acompanhar o computador que eu desbloquear",
+                explanation: "Desbloqueio junto de atividade humana pode mudar o destino. Agentes e tarefas em segundo plano não escolhem."),
+            field("Computador preferido ao iniciar", control:autoPreferred),
+            text("As mudanças esperam a soltura de teclas e botões. A pausa manual sempre prevalece. Escolha Automático no painel para ativar estas regras.",size:12,secondary:true)
+        ])
         let camera = section("Webcam", [switchRow(webcam, title: "Disponibilizar compartilhamento de webcam",
             explanation: "Mostra os controles de webcam externa no painel. A câmera só inicia quando você escolher compartilhar.")])
 
@@ -185,7 +200,7 @@ final class PonteSettingsController: NSWindowController, NSWindowDelegate {
         let content = column([
             text("Seu espaço, do seu jeito", size: 22, weight: .semibold),
             text("Escolha como os dois computadores trabalham juntos.", secondary: true),
-            computers, input, camera, monitorSection, tools
+            computers, input, automaticInput, camera, monitorSection, tools
         ], spacing: 18)
         content.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(content)
@@ -221,6 +236,10 @@ final class PonteSettingsController: NSWindowController, NSWindowDelegate {
         if let item = position.itemArray.first(where: { $0.representedObject as? String == owner.peerPosition }) { position.select(item) }
         protectWindows.state = (original["protect_windows_fullscreen"] as? Bool ?? true) ? .on : .off
         protectMac.state = (original["protect_mac_fullscreen"] as? Bool ?? true) ? .on : .off
+        autoActivity.state = (original["auto_local_activity"] as? Bool ?? true) ? .on : .off
+        autoMonitor.state = (original["auto_monitor"] as? Bool ?? true) ? .on : .off
+        autoUnlock.state = (original["auto_unlock"] as? Bool ?? true) ? .on : .off
+        autoPreferred.selectItem(at: original["auto_preferred"] as? String == "pc" ? 1 : 0)
         webcam.state = (original["webcam_enabled"] as? Bool ?? true) ? .on : .off
         shared.state = (original["shared_monitor"] as? Bool ?? false) ? .on : .off
         manageDisplays.state = (original["manage_displays"] as? Bool ?? false) ? .on : .off
@@ -382,6 +401,10 @@ final class PonteSettingsController: NSWindowController, NSWindowDelegate {
         values["peer_name"] = peer
         values["protect_windows_fullscreen"] = protectWindows.state == .on
         values["protect_mac_fullscreen"] = protectMac.state == .on
+        values["auto_local_activity"] = autoActivity.state == .on
+        values["auto_monitor"] = autoMonitor.state == .on
+        values["auto_unlock"] = autoUnlock.state == .on
+        values["auto_preferred"] = autoPreferred.indexOfSelectedItem == 1 ? "pc" : "mac"
         values["webcam_enabled"] = webcam.state == .on
         values["shared_monitor"] = useShared
         values["manage_displays"] = useShared && manageDisplays.state == .on

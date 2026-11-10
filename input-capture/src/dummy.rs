@@ -11,6 +11,7 @@ use tokio::time::{self, Instant, Interval};
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
 pub struct DummyInputCapture {
+    position: Position,
     start: Option<Instant>,
     interval: Interval,
     offset: (i32, i32),
@@ -19,6 +20,7 @@ pub struct DummyInputCapture {
 impl DummyInputCapture {
     pub fn new() -> Self {
         Self {
+            position: Position::Left,
             start: None,
             interval: time::interval(Duration::from_millis(1)),
             offset: (0, 0),
@@ -34,6 +36,13 @@ impl Default for DummyInputCapture {
 
 #[async_trait]
 impl Capture for DummyInputCapture {
+    fn direct(&mut self, pos: Option<Position>) -> Result<(), CaptureError> {
+        if let Some(pos) = pos {
+            self.position = pos;
+            self.start = None;
+        }
+        Ok(())
+    }
     async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -81,6 +90,6 @@ impl Stream for DummyInputCapture {
                 }))
             }
         };
-        Poll::Ready(Some(Ok((Position::Left, event))))
+        Poll::Ready(Some(Ok((self.position, event))))
     }
 }

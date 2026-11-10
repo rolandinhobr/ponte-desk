@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+if [ "${3:-/}" != / ]; then echo 'Instale o componente no volume de inicialização.' >&2; exit 1; fi
+label=br.com.ponte-desk.storage-helper
+helper=/Library/PrivilegedHelperTools/br.com.ponte-desk.storage-helper
+plist=/Library/LaunchDaemons/br.com.ponte-desk.storage-helper.plist
+# Fail closed if inventory cannot be read. Refuse installation during any
+# Ponte SD session; never unmount a volume or remove a share from this script.
+inventory=$(/usr/sbin/sharing -l -f json)
+if printf '%s' "$inventory" | /usr/bin/grep -Eq '"PDSD_[0-9a-f]{32}"'; then
+  echo 'Encerre a sessão do cartão no Ponte Desk antes de instalar o componente.' >&2
+  exit 1
+fi
+for directory in /Library/PrivilegedHelperTools /Library/LaunchDaemons; do
+  if [ -L "$directory" ] || { [ -e "$directory" ] && { [ ! -d "$directory" ] || [ "$(/usr/bin/stat -f %u "$directory")" != 0 ]; }; }; then
+    echo 'Diretório de instalação inseguro.' >&2; exit 1
+  fi
+  if [ -d "$directory" ]; then
+    mode=$(/usr/bin/stat -f %Lp "$directory")
+    if [ "$((0$mode & 022))" != 0 ]; then echo 'Diretório de instalação permite gravação por terceiros.' >&2; exit 1; fi
+  fi
+done
+for file in "$helper" "$plist"; do
+  if [ -L "$file" ] || { [ -e "$file" ] && { [ ! -f "$file" ] || [ "$(/usr/bin/stat -f %u "$file")" != 0 ]; }; }; then
+    echo 'Arquivo de instalação inseguro.' >&2; exit 1
+  fi
+done
+if job=$(/bin/launchctl print "system/$label" 2>/dev/null); then
+  if printf '%s' "$job" | /usr/bin/grep -q 'parent bundle identifier'; then
+    echo 'Clique em Configurar no Ponte Desk para remover o registro anterior antes da instalação.' >&2
+    exit 1
+  fi
+  /bin/launchctl bootout "system/$label"
+fi

@@ -16,13 +16,19 @@ use input_event::{
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
+
+#[path = "macos_modifiers.rs"]
+mod modifiers;
+use modifiers::KeyAction;
+#[path = "macos_local_modifiers.rs"]
+mod local_modifiers;
+use local_modifiers::LocalModifierMonitor;
 
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
@@ -31,20 +37,109 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
+    /// Read the real session cursor, including moves from local devices/agents.
+    cursor_source: CGEventSource,
+    local_modifiers: LocalModifierMonitor,
     /// task handle for key repeats
     repeat_task: Option<JoinHandle<()>>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
-    /// button previously pressed (evdev button code)
-    previous_button: Option<u32>,
-    /// timestamp of previous click (button down)
-    previous_button_click: Option<Instant>,
-    /// click state, i.e. number of clicks in quick succession
-    button_click_state: i64,
+    clicks: ClickTracker,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
-    /// notify to cancel key repeats
-    notify_repeat_task: Arc<Notify>,
+    pressed_modifiers: HashSet<u32>,
+    /// Persistent cancellation for this key only, including before first poll.
+    repeat_cancel: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+struct ClickTracker {
+    previous: Option<(u32, CGPoint, Instant, i64)>,
+    held: HashMap<u32, i64>,
+}
+impl ClickTracker {
+    fn moved(&mut self, position: CGPoint) {
+        if self.previous.is_some_and(|(_, p, _, _)| {
+            (p.x - position.x).abs() > 4. || (p.y - position.y).abs() > 4.
+        }) {
+            self.previous = None;
+        }
+    }
+    fn transition(&mut self, button: u32, state: u32, position: CGPoint, now: Instant) -> i64 {
+        if state == 0 {
+            return self.held.remove(&button).unwrap_or(1);
+        }
+        if let Some(count) = self.held.get(&button) {
+            return *count;
+        }
+        let count = self
+            .previous
+            .filter(|(b, p, t, _)| {
+                *b == button
+                    && now.duration_since(*t) < DOUBLE_CLICK_INTERVAL
+                    && (p.x - position.x).abs() <= 4.
+                    && (p.y - position.y).abs() <= 4.
+            })
+            .map_or(1, |(_, _, _, n)| n.saturating_add(1));
+        self.previous = Some((button, position, now, count));
+        self.held.insert(button, count);
+        count
+    }
+}
+
+fn new_posting_source() -> Result<CGEventSource, ()> {
+    // Other software can leave aggregate flags behind (e.g. a Cmd+V paste).
+    // Never let that shared state become the bridge's own input state.
+    CGEventSource::new(CGEventSourceStateID::Private)
+}
+
+#[derive(Default)]
+struct LocalPointerModifiers {
+    shift: bool,
+    control: bool,
+    option: bool,
+    command: bool,
+    function: bool,
+    caps_lock: bool,
+}
+
+impl LocalPointerModifiers {
+    fn from_keys(mut down: impl FnMut(CGKeyCode) -> bool, caps_lock: bool) -> Self {
+        Self {
+            command: down(55) || down(54),
+            shift: down(56) || down(60),
+            control: down(59) || down(62),
+            option: down(58) || down(61),
+            function: down(63),
+            caps_lock,
+        }
+    }
+}
+
+fn normalize_pointer_flags(
+    event: &CGEvent,
+    remote: XMods,
+    local: LocalPointerModifiers,
+) -> (u64, u64) {
+    let remote_flags = to_cgevent_flags(remote);
+    let mut local_flags = CGEventFlags::empty();
+    for (held, flag) in [
+        (local.shift, CGEventFlags::CGEventFlagShift),
+        (local.control, CGEventFlags::CGEventFlagControl),
+        (local.option, CGEventFlags::CGEventFlagAlternate),
+        (local.command, CGEventFlags::CGEventFlagCommand),
+        (local.function, CGEventFlags::CGEventFlagSecondaryFn),
+        (local.caps_lock, CGEventFlags::CGEventFlagAlphaShift),
+    ] {
+        if held {
+            local_flags |= flag;
+        }
+    }
+    // Keep the mouse coalescing hint, but no inherited modifier/device bits.
+    let flags =
+        remote_flags | local_flags | (event.get_flags() & CGEventFlags::CGEventFlagNonCoalesced);
+    event.set_flags(flags);
+    (remote_flags.bits(), local_flags.bits())
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -75,23 +170,44 @@ impl MacOSEmulation {
     pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
         request_macos_emulation_permissions()?;
 
-        let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        let event_source =
+            new_posting_source().map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
+        let cursor_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
         Ok(Self {
             event_source,
+            cursor_source,
+            local_modifiers: LocalModifierMonitor::new(),
             pressed_buttons: HashSet::new(),
-            previous_button: None,
-            previous_button_click: None,
-            button_click_state: 0,
+            clicks: ClickTracker::default(),
             repeat_task: None,
-            notify_repeat_task: Arc::new(Notify::new()),
+            repeat_cancel: None,
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            pressed_modifiers: HashSet::new(),
         })
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
-        let event: CGEvent = CGEvent::new(self.event_source.clone()).ok()?;
+        let event: CGEvent = CGEvent::new(self.cursor_source.clone()).ok()?;
         Some(event.location())
+    }
+
+    fn apply_pointer_flags(&self, event: &CGEvent) -> (u64, u64) {
+        normalize_pointer_flags(
+            event,
+            self.modifier_state.get(),
+            self.local_modifiers.sample(),
+        )
+    }
+
+    async fn keyboard_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::Modifier { code, flags } => {
+                modifier_event(self.event_source.clone(), code, flags)
+            }
+            KeyAction::Repeat { code, state: 1 } => self.spawn_repeat_task(code).await,
+            KeyAction::Repeat { .. } => self.cancel_repeat_task().await,
+        }
     }
 
     async fn spawn_repeat_task(&mut self, key: u16) {
@@ -102,46 +218,52 @@ impl MacOSEmulation {
         key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
         // repeat task
         let event_source = self.event_source.clone();
-        let notify = self.notify_repeat_task.clone();
+        let (cancel, cancelled) = oneshot::channel();
+        self.repeat_cancel = Some(cancel);
         let modifiers = self.modifier_state.clone();
-        let repeat_task = tokio::task::spawn_local(async move {
-            let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
-                _ = notify.notified() => true,
-            };
-            if !stop {
-                loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
-                    tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
-                        _ = notify.notified() => break,
-                    }
-                }
-            }
-            // Always release the key with the correct CGKeyCode, regardless of
-            // whether the repeat loop ran. This matches @feschber's review
-            // request: "still release the key repeat task but with the correct
-            // code."
-            //
-            // Do NOT call update_modifiers here: `key` is a Mac CGKeyCode but
-            // update_modifiers expects a Linux evdev scancode, and the two
-            // codespaces collide (e.g. Mac LeftShift=56 == Linux KeyLeftAlt=56,
-            // Mac Down=125 == Linux KeyLeftMeta=125), corrupting modifier
-            // state for chords like Shift+Option+X or Cmd+Down. Modifier state
-            // is owned by the main consume() loop, which already calls
-            // update_modifiers with the correct Linux scancode on the real key
-            // release event from the client.
-            key_event(event_source.clone(), key, 0, modifiers.get());
-        });
+        let repeat_task = tokio::task::spawn_local(repeat_key_events(
+            cancelled,
+            DEFAULT_REPEAT_DELAY,
+            DEFAULT_REPEAT_INTERVAL,
+            move |state| {
+                key_event(event_source.clone(), key, state, modifiers.get());
+            },
+        ));
         self.repeat_task = Some(repeat_task);
     }
 
     async fn cancel_repeat_task(&mut self) {
+        if let Some(cancel) = self.repeat_cancel.take() {
+            let _ = cancel.send(());
+        }
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
             let _ = task.await;
         }
     }
+}
+
+// Run the repeat loop separately so cancellation timing can be tested without
+// creating or posting any native input events.
+async fn repeat_key_events(
+    mut cancelled: oneshot::Receiver<()>,
+    delay: Duration,
+    interval: Duration,
+    mut emit: impl FnMut(u8),
+) {
+    let mut wait = delay;
+    loop {
+        tokio::select! {
+            // A release already sent must win even if the timer is also ready.
+            biased;
+            _ = &mut cancelled => break,
+            _ = tokio::time::sleep(wait) => emit(1),
+        }
+        wait = interval;
+    }
+    // Preserve the unconditional key-up requested in @feschber's review.
+    // The captured code is a Mac CGKeyCode: never translate it as a Linux
+    // scancode or change modifiers here; the real key release owns that state.
+    emit(0);
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
@@ -214,16 +336,24 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     log::trace!("key event: {key} {state}");
 }
 
-fn modifier_event(event_source: CGEventSource, depressed: XMods) {
-    let Ok(event) = CGEvent::new(event_source) else {
-        log::warn!("could not create CGEvent");
+fn new_modifier_event(
+    event_source: CGEventSource,
+    code: CGKeyCode,
+    flags: CGEventFlags,
+) -> Result<CGEvent, ()> {
+    let event = CGEvent::new(event_source)?;
+    event.set_type(CGEventType::FlagsChanged);
+    event.set_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE, i64::from(code));
+    event.set_flags(flags);
+    Ok(event)
+}
+
+fn modifier_event(event_source: CGEventSource, code: CGKeyCode, flags: CGEventFlags) {
+    let Ok(event) = new_modifier_event(event_source, code, flags) else {
+        log::warn!("could not create modifier event");
         return;
     };
-    let flags = to_cgevent_flags(depressed);
-    event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
-    log::trace!("modifiers updated: {depressed:?}");
 }
 
 fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
@@ -328,14 +458,20 @@ impl Emulation for MacOSEmulation {
                         let event_type = self
                             .pressed_buttons
                             .iter()
-                            .next()
+                            .min()
                             .map(|&btn| drag_event_type(btn))
                             .unwrap_or(CGEventType::MouseMoved);
+                        self.clicks.moved(mouse_location);
+                        let mouse_button = match event_type {
+                            CGEventType::RightMouseDragged => CGMouseButton::Right,
+                            CGEventType::OtherMouseDragged => CGMouseButton::Center,
+                            _ => CGMouseButton::Left,
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
                             mouse_location,
-                            CGMouseButton::Left,
+                            mouse_button,
                         ) {
                             Ok(e) => e,
                             Err(_) => {
@@ -345,6 +481,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
+                        self.apply_pointer_flags(&event);
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Button {
@@ -384,24 +521,12 @@ impl Emulation for MacOSEmulation {
                             self.pressed_buttons.remove(&button);
                         }
 
-                        // update double-click tracking using the evdev button
-                        // code so that back/forward don't alias with middle
-                        if state == 1 {
-                            if self.previous_button == Some(button)
-                                && self
-                                    .previous_button_click
-                                    .is_some_and(|i| i.elapsed() < DOUBLE_CLICK_INTERVAL)
-                            {
-                                self.button_click_state += 1;
-                            } else {
-                                self.button_click_state = 1;
-                            }
-                            self.previous_button = Some(button);
-                            self.previous_button_click = Some(Instant::now());
-                        }
-
-                        log::debug!("click_state: {}", self.button_click_state);
-                        let location = self.get_mouse_location().unwrap();
+                        let Some(location) = self.get_mouse_location() else {
+                            return Ok(());
+                        };
+                        let click_state =
+                            self.clicks
+                                .transition(button, state, location, Instant::now());
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
@@ -416,7 +541,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(
                             EventField::MOUSE_EVENT_CLICK_STATE,
-                            self.button_click_state,
+                            click_state,
                         );
                         // Set the button number for extra buttons (back=3, forward=4)
                         if let Some(btn_num) = cg_button_number {
@@ -425,6 +550,14 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
+                        let sources = self.apply_pointer_flags(&event);
+                        input_event::button_diagnostics::posted_transition_with_sources(
+                            button,
+                            state,
+                            click_state,
+                            event.get_flags().bits(),
+                            sources,
+                        );
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::Axis {
@@ -453,6 +586,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
+                        self.apply_pointer_flags(&event);
                         event.post(CGEventTapLocation::HID);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
@@ -477,13 +611,9 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
+                        self.apply_pointer_flags(&event);
                         event.post(CGEventTapLocation::HID);
                     }
-                }
-
-                // reset button click state in case it's not a button event
-                if !matches!(pointer_event, PointerEvent::Button { .. }) {
-                    self.button_click_state = 0;
                 }
             }
             Event::Keyboard(keyboard_event) => match keyboard_event {
@@ -508,14 +638,14 @@ impl Emulation for MacOSEmulation {
                             }
                         },
                     };
-                    let is_modifier = update_modifiers(&self.modifier_state, key, state);
-                    if is_modifier {
-                        modifier_event(self.event_source.clone(), self.modifier_state.get());
-                    }
-                    match state {
-                        // pressed
-                        1 => self.spawn_repeat_task(code).await,
-                        _ => self.cancel_repeat_task().await,
+                    for action in modifiers::raw_actions(
+                        &self.modifier_state,
+                        &mut self.pressed_modifiers,
+                        key,
+                        code,
+                        state,
+                    ) {
+                        self.keyboard_action(action).await;
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -524,8 +654,14 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
-                    set_modifiers(&self.modifier_state, depressed, latched, locked, group);
-                    modifier_event(self.event_source.clone(), self.modifier_state.get());
+                    let _ = (latched, locked, group);
+                    for action in modifiers::absolute_actions(
+                        &self.modifier_state,
+                        &mut self.pressed_modifiers,
+                        depressed,
+                    ) {
+                        self.keyboard_action(action).await;
+                    }
                 }
             },
         }
@@ -537,49 +673,9 @@ impl Emulation for MacOSEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
-}
-
-fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
-    if let Ok(key) = scancode::Linux::try_from(key) {
-        let mask = match key {
-            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-            scancode::Linux::KeyCapsLock => XMods::LockMask,
-            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-            _ => XMods::empty(),
-        };
-        // unchanged
-        if mask.is_empty() {
-            return false;
-        }
-        let mut mods = modifiers.get();
-        match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
-        }
-        modifiers.set(mods);
-        true
-    } else {
-        false
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
     }
-}
-
-fn set_modifiers(
-    active_modifiers: &Cell<XMods>,
-    depressed: u32,
-    latched: u32,
-    locked: u32,
-    group: u32,
-) {
-    let depressed = XMods::from_bits(depressed).unwrap_or_default();
-    let _latched = XMods::from_bits(latched).unwrap_or_default();
-    let _locked = XMods::from_bits(locked).unwrap_or_default();
-    let _group = XMods::from_bits(group).unwrap_or_default();
-
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
 }
 
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
@@ -678,5 +774,272 @@ mod scroll_direction_tests {
     fn invalid_axis_is_rejected_and_extreme_delta_does_not_overflow() {
         assert_eq!(quartz_scroll_wheels(2, 120), None);
         assert_eq!(quartz_scroll_wheels(0, i32::MIN), Some((1, i32::MAX, 0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod repeat_cancellation_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[tokio::test]
+    async fn repeat_cancellation_before_first_poll_never_hangs() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (cancel, cancelled) = oneshot::channel();
+                let states = Rc::new(RefCell::new(Vec::new()));
+                let recorded = states.clone();
+                let task = tokio::task::spawn_local(repeat_key_events(
+                    cancelled,
+                    DEFAULT_REPEAT_DELAY,
+                    DEFAULT_REPEAT_INTERVAL,
+                    move |state| {
+                        recorded.borrow_mut().push(state);
+                    },
+                ));
+                // Reproduces the fast down/up race before the repeat task runs.
+                cancel.send(()).unwrap();
+                let completed = tokio::time::timeout(Duration::from_millis(100), task).await;
+                assert!(
+                    completed.is_ok(),
+                    "key release lost its cancellation signal"
+                );
+                assert_eq!(&*states.borrow(), &[0]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn active_repeat_cancels_and_releases_exactly_once() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (cancel, cancelled) = oneshot::channel();
+                let (began, started) = oneshot::channel();
+                let mut began = Some(began);
+                let states = Rc::new(RefCell::new(Vec::new()));
+                let recorded = states.clone();
+                let task = tokio::task::spawn_local(repeat_key_events(
+                    cancelled,
+                    Duration::ZERO,
+                    Duration::from_secs(60),
+                    move |state| {
+                        recorded.borrow_mut().push(state);
+                        if state == 1 {
+                            if let Some(began) = began.take() {
+                                let _ = began.send(());
+                            }
+                        }
+                    },
+                ));
+                tokio::time::timeout(Duration::from_secs(2), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                cancel.send(()).unwrap();
+                tokio::time::timeout(Duration::from_millis(100), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&*states.borrow(), &[1, 0]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fast_key_pairs_do_not_share_or_lose_cancellation() {
+        for _ in 0..1000 {
+            let (cancel, cancelled) = oneshot::channel();
+            let mut states = Vec::new();
+            cancel.send(()).unwrap();
+            repeat_key_events(
+                cancelled,
+                DEFAULT_REPEAT_DELAY,
+                DEFAULT_REPEAT_INTERVAL,
+                |state| states.push(state),
+            )
+            .await;
+            assert_eq!(states, vec![0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_cancellation_owner_still_releases_key() {
+        let (cancel, cancelled) = oneshot::channel();
+        drop(cancel);
+        let mut states = Vec::new();
+        repeat_key_events(
+            cancelled,
+            DEFAULT_REPEAT_DELAY,
+            DEFAULT_REPEAT_INTERVAL,
+            |state| states.push(state),
+        )
+        .await;
+        assert_eq!(states, vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod click_tracking_tests {
+    use super::*;
+    #[test]
+    fn click_release_keeps_count_during_motion_and_double_click_requires_proximity() {
+        let mut clicks = ClickTracker::default();
+        let now = Instant::now();
+        let p = CGPoint::new(10., 10.);
+        assert_eq!(clicks.transition(BTN_LEFT, 1, p, now), 1);
+        clicks.moved(CGPoint::new(11., 10.));
+        assert_eq!(clicks.transition(BTN_LEFT, 0, p, now), 1);
+        assert_eq!(
+            clicks.transition(BTN_LEFT, 1, p, now + Duration::from_millis(100)),
+            2
+        );
+        clicks.moved(CGPoint::new(300., 200.));
+        assert_eq!(
+            clicks.transition(BTN_LEFT, 0, CGPoint::new(300., 200.), now),
+            2
+        );
+        assert_eq!(
+            clicks.transition(
+                BTN_LEFT,
+                1,
+                CGPoint::new(300., 200.),
+                now + Duration::from_millis(200)
+            ),
+            1
+        );
+    }
+    #[test]
+    fn rapid_clicks_at_different_locations_and_duplicate_down_are_single_clicks() {
+        let mut c = ClickTracker::default();
+        let now = Instant::now();
+        let p = CGPoint::new(1., 1.);
+        assert_eq!(c.transition(BTN_LEFT, 1, p, now), 1);
+        assert_eq!(c.transition(BTN_LEFT, 1, p, now), 1);
+        assert_eq!(c.transition(BTN_LEFT, 0, p, now), 1);
+        assert_eq!(
+            c.transition(
+                BTN_LEFT,
+                1,
+                CGPoint::new(200., 200.),
+                now + Duration::from_millis(10)
+            ),
+            1
+        );
+        assert_eq!(
+            c.transition(BTN_RIGHT, 1, p, now + Duration::from_millis(20)),
+            1
+        );
+        assert_eq!(c.transition(BTN_LEFT, 0, p, now), 1);
+    }
+}
+
+#[cfg(test)]
+mod pointer_modifier_tests {
+    use super::*;
+
+    #[test]
+    fn modifier_release_event_identifies_the_released_key() {
+        for code in [54, 55, 56, 60, 58, 61, 59, 62] {
+            let event =
+                new_modifier_event(new_posting_source().unwrap(), code, CGEventFlags::empty())
+                    .unwrap();
+            assert_eq!(event.get_type() as u32, CGEventType::FlagsChanged as u32);
+            assert_eq!(
+                event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE),
+                i64::from(code)
+            );
+            assert_eq!(event.get_flags(), CGEventFlags::empty());
+        }
+    }
+
+    fn mouse(source: CGEventSource) -> CGEvent {
+        CGEvent::new_mouse_event(
+            source,
+            CGEventType::LeftMouseDown,
+            CGPoint::new(0., 0.),
+            CGMouseButton::Left,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dictation_command_flag_cannot_turn_single_click_into_command_click() {
+        let event = mouse(new_posting_source().unwrap());
+        // A dictation-style paste leaves aggregate Cmd and left-Cmd flags.
+        event.set_flags(CGEventFlags::from_bits_retain(0x0010_0008));
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+        normalize_pointer_flags(&event, XMods::empty(), LocalPointerModifiers::default());
+        assert_eq!(
+            event.get_flags(),
+            CGEventFlags::empty(),
+            "unheld Command leaked into the pointer event"
+        );
+        assert_eq!(
+            event.get_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE),
+            1
+        );
+    }
+
+    #[test]
+    fn genuine_remote_and_local_modifier_chords_are_preserved_then_released() {
+        let event = mouse(new_posting_source().unwrap());
+        event.set_flags(CGEventFlags::empty());
+        normalize_pointer_flags(
+            &event,
+            XMods::ShiftMask | XMods::ControlMask,
+            LocalPointerModifiers {
+                command: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            event.get_flags(),
+            CGEventFlags::CGEventFlagShift
+                | CGEventFlags::CGEventFlagControl
+                | CGEventFlags::CGEventFlagCommand
+        );
+        normalize_pointer_flags(&event, XMods::empty(), LocalPointerModifiers::default());
+        assert_eq!(event.get_flags(), CGEventFlags::empty());
+    }
+
+    #[test]
+    fn local_modifier_sides_caps_and_fn_are_kept_without_inherited_command() {
+        for keys in [[55, 56, 59, 58, 63], [54, 60, 62, 61, 63]] {
+            let event = mouse(new_posting_source().unwrap());
+            event.set_flags(CGEventFlags::CGEventFlagNonCoalesced);
+            normalize_pointer_flags(
+                &event,
+                XMods::empty(),
+                LocalPointerModifiers::from_keys(|k| keys.contains(&k), true),
+            );
+            assert_eq!(
+                event.get_flags(),
+                CGEventFlags::CGEventFlagCommand
+                    | CGEventFlags::CGEventFlagShift
+                    | CGEventFlags::CGEventFlagControl
+                    | CGEventFlags::CGEventFlagAlternate
+                    | CGEventFlags::CGEventFlagSecondaryFn
+                    | CGEventFlags::CGEventFlagAlphaShift
+                    | CGEventFlags::CGEventFlagNonCoalesced
+            );
+        }
+    }
+
+    #[test]
+    fn posting_state_is_private_and_does_not_replace_global_cursor_reads() {
+        let posted = mouse(new_posting_source().unwrap());
+        let cursor = mouse(CGEventSource::new(CGEventSourceStateID::CombinedSessionState).unwrap());
+        assert_ne!(
+            posted.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
+            0
+        );
+        assert_ne!(
+            posted.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
+            1
+        );
+        assert_eq!(
+            cursor.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID),
+            0
+        );
     }
 }
